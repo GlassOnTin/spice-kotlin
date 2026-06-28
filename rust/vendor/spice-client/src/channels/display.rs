@@ -369,7 +369,7 @@ impl DisplayChannel {
     pub fn get_primary_surface(&self) -> Option<&DisplaySurface> {
         let surface = self.surfaces.get(&0);
         if surface.is_none() {
-            eprintln!(
+            warn!(
                 "DisplayChannel: No primary surface available. Total surfaces: {}",
                 self.surfaces.len()
             );
@@ -1343,10 +1343,6 @@ impl DisplayChannel {
             info!("Display mode: {}x{}, format: {}", width, height, format);
 
             // Create primary surface (ID 0)
-            eprintln!(
-                "DisplayChannel: Creating primary surface {}x{} format {}",
-                width, height, format
-            );
             self.surfaces.insert(
                 0,
                 DisplaySurface {

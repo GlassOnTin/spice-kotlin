@@ -141,6 +141,23 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
   Known gap: `notify_cursor_update` only fires while a shape is set, so an explicit
   FLAGS_NONE (cursor cleared) does not propagate to the callback.
 
+- **Multi-surface validation + hot-path stderr cleanup** (`src/channels/display.rs`,
+  Phase H): the off-screen surface path was already structurally complete —
+  SURFACE_CREATE (318) inserts a `DisplaySurface` keyed by `surface_id`, SURFACE_DESTROY
+  (319) removes it, and every draw op (`fill_rect`/`blit_image_to_surface`/COPY_BITS)
+  targets `self.surfaces.get_mut(&surface_id)`, so non-primary blit targets render to the
+  right surface. Validated the wire structs against `spice/protocol.h`:
+  `SpiceMsgSurfaceCreate` (5×u32 = 20 B), `SpiceMsgSurfaceDestroy` (u32),
+  `SpiceHead` (7×u32/i32 = 28 B), `SpiceMonitorsConfig` (count u16, max u16, heads[]) —
+  all packed, no spurious padding, correct as-is. Removed the two per-paint `eprintln!`s
+  (the unfilterable ones that bypassed `tracing`): "No primary surface" → `warn!`,
+  "Creating primary surface" deleted (redundant with the `info!` above it).
+  - Verified: off-server (BITMAP) still renders correct 1024×768 frames after the edits,
+    and a default-subscriber run shows **zero raw eprintln** on stderr (only structured,
+    filterable `tracing` INFO from one-time connection setup). **Not** validated against a
+    live multi-surface guest — modern QXL-KMDOD Windows uses only surface 0 (same reason
+    FROM_CACHE never fires); non-primary surfaces need a 2D-accel QXL guest.
+
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
 `SpiceBitmap`, `SpiceClip`, `SpiceDrawCopy`, `SpiceAddress`) still carry the
