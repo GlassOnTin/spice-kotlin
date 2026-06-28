@@ -127,9 +127,13 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
+            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
+            // a non-zero GLZ dictionary window is REQUIRED for the server to send
+            // GLZ_RGB at all — our decoder maintains the matching glz_window.
             cache_id: 0,
-            cache_size: 0, // Disabled - server sending cached refs without images
-            glz_dict_id: 0,
+            cache_size: 0,
+            glz_dict_id: 1,
+            glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
 
         // Serialize the message
@@ -206,9 +210,13 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
+            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
+            // a non-zero GLZ dictionary window is REQUIRED for the server to send
+            // GLZ_RGB at all — our decoder maintains the matching glz_window.
             cache_id: 0,
-            cache_size: 0, // Disabled - server sending cached refs without images
-            glz_dict_id: 0,
+            cache_size: 0,
+            glz_dict_id: 1,
+            glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
 
         // Serialize the message
@@ -288,9 +296,13 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
+            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
+            // a non-zero GLZ dictionary window is REQUIRED for the server to send
+            // GLZ_RGB at all — our decoder maintains the matching glz_window.
             cache_id: 0,
-            cache_size: 0, // Disabled - server sending cached refs without images
-            glz_dict_id: 0,
+            cache_size: 0,
+            glz_dict_id: 1,
+            glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
 
         // Serialize the message
@@ -479,6 +491,7 @@ impl DisplayChannel {
             data[offset + 16],
             data[offset + 17],
         ]);
+        debug!("decode_image_at off={offset} type={img_type} {width}x{height}");
         match img_type {
             SPICE_IMAGE_TYPE_BITMAP => self.decode_bitmap_inline(data, offset + 18, width, height),
             SPICE_IMAGE_TYPE_LZ_RGB => {

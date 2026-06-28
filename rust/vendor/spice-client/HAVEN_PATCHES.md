@@ -38,6 +38,25 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
   bytes/pixel → BGRX) and RGBA (extra alpha LZSS pass); RGB16/PLT deferred.
   Out-of-range back-references return `None` (surface left untouched, no panic).
   Verified: `image-compression=lz` server renders a correct 1024×768 frame.
+- **GLZ_RGB decoder** (`decode_glz` + `glz_window` + `glz_decode_body`,
+  `src/channels/display.rs`): port of the spice-gtk GLZ decoder. GLZ is LZSS whose
+  back-references may reach into **earlier decoded images** held in a per-channel
+  window (`glz_window: HashMap<image_id, GlzImage>`); each decoded image is inserted
+  and the window is trimmed by id. Same 28-byte big-endian stream header as LZ.
+- **GLZ enablement = `SpiceMsgcDisplayInit`, not link caps** (`src/protocol.rs`,
+  `src/channels/display.rs`): the spice-server only emits GLZ_RGB once the client
+  sends a `DISPLAY_INIT` with a **non-zero GLZ dictionary window**. Two bugs blocked
+  this: `SpiceMsgcDisplayInit` was mis-padded (`pad_before=7` → 17 bytes, every field
+  shifted) **and** lacked the `glz_dictionary_window_size` field entirely, so the
+  server always saw a zero window and fell back to LZ_RGB. Fixed: packed layout
+  (14 bytes) + `glz_dictionary_window_size: i32` set to 16 MiB−1 at all three
+  DISPLAY_INIT sites. Caps/MINI_HEADER are **not** required (a 0-cap client gets GLZ).
+- **`SpiceLinkMess` packed** (`src/protocol.rs`): removed `pad_before=2` (20→18
+  bytes, `caps_offset=18`). Tolerated at 0 caps but corrupts `num_channel_caps` the
+  moment any cap is advertised (server read 65536 → INVALID_DATA). Correctness fix.
+  - Verified: a `image-compression=glz`-forced Windows Server 2025 streams ~115
+    GLZ_RGB images per LogonUI paint; all decode with **0 warnings** and the captured
+    frame (login window, glyphs, password dots, cursor) is pixel-correct.
 
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
@@ -94,11 +113,11 @@ Verified end-to-end against default `auto_glz` QEMU (Ubuntu installer): a QMP
 wheel-scroll of the language list streams incremental DRAW_COPY repaints that
 decode pixel-correct (3 frames, `Recv-Q` stays 0, no decode warnings). NB the
 repaints arrive as **LZ_RGB (101)**, so this validates the LZ path on incremental
-frames; **GLZ (102) real-traffic validation is still pending** a
-`image-compression=glz`-forced server (GLZ currently covered only by unit tests).
+frames. **GLZ (102) is now validated** on real `image-compression=glz` traffic — see
+the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/paint,
+0 decode warnings, frame pixel-correct).
 
 ## TODO (in progress)
-- GLZ (102) real-traffic validation against a `glz`-forced QEMU.
 - ZLIB_GLZ_RGB (107) / QUIC (1) / LZ4 (109) image decoders.
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
 - Cursor channel shapes; multi-surface; remaining draw ops (FILL/OPAQUE/COPY_BITS).

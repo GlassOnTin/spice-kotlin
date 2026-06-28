@@ -95,14 +95,15 @@ fn test_spice_link_mess_serialization() {
         channel_id: 0,
         num_common_caps: 2,
         num_channel_caps: 3,
-        caps_offset: 20, // caps_offset is size of SpiceLinkMess
+        caps_offset: 18, // caps_offset == packed size of SpiceLinkMess
     };
 
     // Write to bytes
     let mut cursor = Cursor::new(Vec::new());
     mess.write(&mut cursor).unwrap();
     let bytes = cursor.into_inner();
-    assert_eq!(bytes.len(), 20, "SpiceLinkMess should be 20 bytes");
+    // SPICE wire SpiceLinkMess is PACKED (no alignment padding) — 18 bytes.
+    assert_eq!(bytes.len(), 18, "SpiceLinkMess should be 18 bytes (packed)");
 
     // Read back
     let mut cursor = Cursor::new(&bytes);
@@ -210,7 +211,7 @@ fn test_struct_sizes() {
     };
     let mut cursor = Cursor::new(Vec::new());
     mess.write(&mut cursor).unwrap();
-    assert_eq!(cursor.into_inner().len(), 20);
+    assert_eq!(cursor.into_inner().len(), 18); // packed (no alignment padding)
 }
 
 #[test]

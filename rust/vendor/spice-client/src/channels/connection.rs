@@ -196,8 +196,8 @@ impl ChannelConnection {
             _ => {}
         }
 
-        // Calculate message size
-        let message_size = 20 + (common_caps.len() + channel_caps.len()) * 4;
+        // Calculate message size (packed SpiceLinkMess = 18 bytes, no padding)
+        let message_size = 18 + (common_caps.len() + channel_caps.len()) * 4;
 
         let header = SpiceLinkHeader {
             magic: SPICE_MAGIC,
@@ -212,7 +212,7 @@ impl ChannelConnection {
             channel_id: self.channel_id,
             num_common_caps: common_caps.len() as u32,
             num_channel_caps: channel_caps.len() as u32,
-            caps_offset: 20, // Offset where capabilities start (after the struct)
+            caps_offset: 18, // packed SpiceLinkMess size (no alignment padding)
         };
 
         // Serialize and send header

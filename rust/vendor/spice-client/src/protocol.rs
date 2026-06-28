@@ -123,8 +123,12 @@ pub struct SpiceLinkMess {
     pub connection_id: u32,
     pub channel_type: u8,
     pub channel_id: u8,
-    #[br(pad_before = 2)]
-    #[bw(pad_before = 2)] // Write 2 bytes padding for alignment
+    // HAVEN: SPICE wire SpiceLinkMess is PACKED (18 bytes, no alignment
+    // padding) — verified against remote-viewer's link (caps_offset=18). The
+    // earlier pad_before=2 made it 20 bytes; with 0 advertised caps the server
+    // tolerated it, but any advertised cap shifted num_channel_caps by one word
+    // so the server read a garbage count (65536) and rejected the link with
+    // INVALID_DATA. caps_offset must equal this struct's packed size.
     pub num_common_caps: u32,
     pub num_channel_caps: u32,
     pub caps_offset: u32,
@@ -352,11 +356,15 @@ pub const SPICE_MSGC_DISPLAY_INIT: u16 = 101;
 #[brw(little)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SpiceMsgcDisplayInit {
+    // HAVEN: SPICE wire structs are PACKED (no C alignment padding) — same as
+    // SpiceLinkMess. The earlier pad_before=7 made this 17 bytes and shifted
+    // every field, and the struct was missing glz_dictionary_window_size
+    // entirely, so the server saw a zero GLZ window and could only ever reply
+    // with LZ_RGB, never GLZ_RGB. Packed layout = 14 bytes.
     pub cache_id: u8,
-    #[br(pad_before = 7)] // Padding for 8-byte alignment before i64
-    #[bw(pad_before = 7)]
     pub cache_size: i64,
     pub glz_dict_id: u8,
+    pub glz_dictionary_window_size: i32,
 }
 
 #[binrw]

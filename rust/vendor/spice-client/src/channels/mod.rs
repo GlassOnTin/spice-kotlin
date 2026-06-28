@@ -387,13 +387,16 @@ impl ChannelConnection {
 
     /// Get common capabilities supported by this client
     fn get_common_capabilities(&self) -> Vec<u32> {
-        // Don't advertise any capabilities for test-display-no-ssl
+        // No common caps needed: GLZ is gated by DISPLAY_INIT's glz_window, not
+        // by link caps (verified — a 0-cap client gets GLZ from a glz server).
         vec![]
     }
 
     /// Get channel-specific capabilities
     fn get_channel_capabilities(&self) -> Vec<u32> {
-        // No channel-specific capabilities for now - focus on basic connectivity
+        // No channel caps: still-image decode only. Not advertising the
+        // streaming/codec caps keeps the server sending images we can decode
+        // rather than h264/vp8 video streams.
         vec![]
     }
 
@@ -457,7 +460,7 @@ impl ChannelConnection {
             channel_id: self.channel_id,
             num_common_caps: common_caps_bitmap.len() as u32,
             num_channel_caps: channel_caps_bitmap.len() as u32,
-            caps_offset: 20, // Actual serialized size with padding
+            caps_offset: 18, // packed SpiceLinkMess size (no alignment padding)
         };
 
         // Use binrw for proper SPICE protocol serialization
