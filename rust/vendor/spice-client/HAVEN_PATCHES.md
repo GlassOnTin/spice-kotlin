@@ -99,6 +99,22 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
     images decoded across 131 display updates with **0 warnings / 0 bad-magic / 0
     panics**, and the captured frame (LogonUI window chrome, colored prompt text,
     password dots, cursor) is pixel-correct.
+- **DRAW_FILL + DRAW_OPAQUE + draw-op refactor** (`src/channels/display.rs`, Phase F):
+  added a shared `parse_draw_base` (surface_id u32 | bbox Rect | clip; the RECTS clip
+  is inline, not a pointer) and a `ropd_is_plain_copy` helper for SPICE_ROPD flags,
+  plus free `fill_surface_rect` / `blit_to_surface` (the pixel loops, so they unit-test
+  on a bare `DisplaySurface`). **DRAW_FILL (302)** paints a SOLID brush (color
+  `0x00RRGGBB` → surface RGBA) over the bbox under a plain (PUT/0) rop; non-solid
+  brushes and combine/invert rops `debug!`-and-skip. **DRAW_OPAQUE (303)** decodes its
+  `src_image` and blits `src_area`→bbox exactly like DRAW_COPY (for a PUT rop the image
+  fully covers the brushed bbox). DRAW_COPY was rewritten onto the shared helpers (no
+  behaviour change). COPY_BITS (104, surface→surface) was already implemented. Lower-
+  frequency ops (BLEND/STROKE/TEXT/INVERS/ROP3) still log-and-skip.
+  - Verified: 6 unit tests (rop classification, `parse_draw_base` NONE + inline-RECTS
+    offsets, fill clamp/RGBA, blit src→bbox); 78 crate tests green. **Not** validated
+    against a live Linux desktop yet — a composited GNOME/QXL-KMDOD guest sends mostly
+    DRAW_COPY (LZ), so DRAW_FILL/OPAQUE need a 2D-drawing guest (X11 + xf86-video-qxl)
+    to exercise on the wire.
 
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
@@ -166,7 +182,8 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 - FROM_CACHE (103) real-traffic check against a 2D-accel QXL guest (decode implemented;
   modern Windows QXL is display-only so no cache hints — see the FROM_CACHE entry above).
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
-- Cursor channel shapes; multi-surface; remaining draw ops (FILL/OPAQUE/COPY_BITS).
+- Cursor channel shapes; multi-surface. (FILL/OPAQUE/COPY_BITS draw ops done — Phase F.)
+- Live-wire validation of DRAW_FILL/DRAW_OPAQUE against a 2D-drawing Linux SPICE guest.
 - `MSG_PING` (type 4, 12-byte body) currently logged-and-skipped; add PONG if a
   server starts disconnecting idle clients.
 

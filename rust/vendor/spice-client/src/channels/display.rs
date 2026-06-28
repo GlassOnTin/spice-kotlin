@@ -1144,6 +1144,134 @@ fn glz_decode_body(
         Some(ip)
     }
 
+// --- Phase F draw-op helpers -------------------------------------------------
+
+// SPICE_ROPD_* raster-op-descriptor flags (enums.h). A plain "put" (straight
+// copy/fill) is OP_PUT with none of the invert or combine bits set.
+const ROPD_INVERS_SRC: u16 = 1 << 0;
+const ROPD_INVERS_BRUSH: u16 = 1 << 1;
+const ROPD_INVERS_DEST: u16 = 1 << 2;
+const ROPD_OP_OR: u16 = 1 << 4;
+const ROPD_OP_AND: u16 = 1 << 5;
+const ROPD_OP_XOR: u16 = 1 << 6;
+const ROPD_OP_BLACKNESS: u16 = 1 << 7;
+const ROPD_OP_WHITENESS: u16 = 1 << 8;
+const ROPD_OP_INVERS: u16 = 1 << 9;
+const ROPD_INVERS_RES: u16 = 1 << 10;
+
+/// True when a rop_descriptor is a plain copy/put: no invert flags and no
+/// combine op (OR/AND/XOR/INVERS/black/white). OP_PUT alone, or an
+/// unspecified rop (0) some servers send for a straight blit, both qualify.
+/// Exotic rops are logged and skipped rather than mis-painted.
+fn ropd_is_plain_copy(rop: u16) -> bool {
+    let invert = ROPD_INVERS_SRC | ROPD_INVERS_BRUSH | ROPD_INVERS_DEST | ROPD_INVERS_RES;
+    let combine =
+        ROPD_OP_OR | ROPD_OP_AND | ROPD_OP_XOR | ROPD_OP_BLACKNESS | ROPD_OP_WHITENESS | ROPD_OP_INVERS;
+    rop & invert == 0 && rop & combine == 0
+}
+
+/// Parse the SpiceDrawBase common header shared by every draw op, returning
+/// (surface_id, bounding box, byte offset just past the clip). Wire, verified
+/// against QEMU (see DrawCopy): surface_id u32 | bbox Rect(16) | clip_type u8
+/// [+ inline num_rects u32 + num_rects*Rect(16) when the clip is RECTS]. SPICE
+/// wire structs are packed; the RECTS clip is inline here, not via a pointer.
+fn parse_draw_base(data: &[u8]) -> Option<(u32, SpiceRect, usize)> {
+    if data.len() < 21 {
+        return None;
+    }
+    let rd_i32 = |o: usize| i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    let rd_u32 = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    let surface_id = rd_u32(0);
+    let bbox = SpiceRect {
+        top: rd_i32(4),
+        left: rd_i32(8),
+        bottom: rd_i32(12),
+        right: rd_i32(16),
+    };
+    let clip_type = data[20];
+    let mut off = 21usize;
+    if clip_type == ClipType::Rects as u8 {
+        if off + 4 > data.len() {
+            return None;
+        }
+        let num_rects = rd_u32(off) as usize;
+        off += 4 + num_rects * 16;
+    }
+    Some((surface_id, bbox, off))
+}
+
+/// Fill an axis-aligned rect on a 32bpp surface with one RGBA pixel, clamped
+/// to the surface bounds. (DrawFill body; free fn so it's unit-testable on a
+/// bare DisplaySurface without a live channel.)
+fn fill_surface_rect(surface: &mut DisplaySurface, rect: &SpiceRect, rgba: [u8; 4]) {
+    let sw = surface.width as i32;
+    let sh = surface.height as i32;
+    let left = rect.left.clamp(0, sw) as usize;
+    let top = rect.top.clamp(0, sh) as usize;
+    let right = rect.right.clamp(0, sw) as usize;
+    let bottom = rect.bottom.clamp(0, sh) as usize;
+    let stride = surface.width as usize * 4;
+    for y in top..bottom {
+        let row = y * stride;
+        for x in left..right {
+            let o = row + x * 4;
+            if o + 4 <= surface.data.len() {
+                surface.data[o..o + 4].copy_from_slice(&rgba);
+            }
+        }
+    }
+}
+
+/// Blit a decoded RGBA image's `src_area` into `bbox` on a 32bpp surface as a
+/// plain copy, clamped to both rectangles. (DrawCopy/DrawOpaque body; free fn
+/// so it's unit-testable on a bare DisplaySurface.)
+fn blit_to_surface(
+    surface: &mut DisplaySurface,
+    image_data: &[u8],
+    img_width: u32,
+    img_height: u32,
+    src_area: &SpiceRect,
+    bbox: &SpiceRect,
+) {
+    let bpp = 4;
+    let surface_stride = surface.width as usize * bpp;
+    let image_stride = img_width as usize * bpp;
+
+    let src_left = src_area.left.max(0) as usize;
+    let src_top = src_area.top.max(0) as usize;
+    let src_right = src_area.right.min(img_width as i32) as usize;
+    let src_bottom = src_area.bottom.min(img_height as i32) as usize;
+
+    let dst_left = bbox.left.max(0) as usize;
+    let dst_top = bbox.top.max(0) as usize;
+    let dst_right = bbox.right.min(surface.width as i32) as usize;
+    let dst_bottom = bbox.bottom.min(surface.height as i32) as usize;
+
+    // saturating_sub: dst/src rects may exceed the surface.
+    let copy_width = src_right
+        .saturating_sub(src_left)
+        .min(dst_right.saturating_sub(dst_left));
+    let copy_height = src_bottom
+        .saturating_sub(src_top)
+        .min(dst_bottom.saturating_sub(dst_top));
+
+    for y in 0..copy_height {
+        let src_y = src_top + y;
+        let dst_y = dst_top + y;
+        if src_y < img_height as usize && dst_y < surface.height as usize {
+            let src_row = src_y * image_stride;
+            let dst_row = dst_y * surface_stride;
+            for x in 0..copy_width {
+                let so = src_row + (src_left + x) * bpp;
+                let dofs = dst_row + (dst_left + x) * bpp;
+                if so + 4 <= image_data.len() && dofs + 4 <= surface.data.len() {
+                    surface.data[dofs..dofs + 4].copy_from_slice(&image_data[so..so + 4]);
+                }
+            }
+        }
+    }
+}
+
 impl DisplayChannel {
     /// Decode zlib compressed image
     fn decode_zlib(
@@ -1236,129 +1364,157 @@ impl DisplayChannel {
         Ok(())
     }
 
+    /// Fill an axis-aligned rect on a surface with one RGBA pixel (Phase F
+    /// DrawFill), then notify. No-op if the surface is unknown.
+    fn fill_rect(&mut self, surface_id: u32, rect: &SpiceRect, rgba: [u8; 4]) {
+        let painted = match self.surfaces.get_mut(&surface_id) {
+            Some(surface) => {
+                fill_surface_rect(surface, rect, rgba);
+                true
+            }
+            None => false,
+        };
+        if painted {
+            self.notify_update(surface_id);
+        }
+    }
+
+    /// Blit a decoded RGBA image's `src_area` into `bbox` on a surface (plain
+    /// copy), then notify. Shared by DrawCopy and DrawOpaque.
+    fn blit_image_to_surface(
+        &mut self,
+        surface_id: u32,
+        image_data: &[u8],
+        img_width: u32,
+        img_height: u32,
+        src_area: &SpiceRect,
+        bbox: &SpiceRect,
+    ) {
+        let painted = match self.surfaces.get_mut(&surface_id) {
+            Some(surface) => {
+                blit_to_surface(surface, image_data, img_width, img_height, src_area, bbox);
+                true
+            }
+            None => false,
+        };
+        if painted {
+            self.notify_update(surface_id);
+        }
+    }
+
     async fn handle_draw_message(&mut self, msg_type: u16, data: &[u8]) -> Result<()> {
         match msg_type {
             x if x == DisplayChannelMessage::DrawFill as u16 => {
-                // Implemented in Phase F (solid-brush rect fill). Skip rather
-                // than paint a fake test pattern.
-                debug!("DrawFill ({} bytes) — not yet implemented, skipping", data.len());
+                // SpiceFill = base + brush + rop_descriptor u16 + mask. We
+                // paint SOLID brushes under a plain (PUT) rop as a flat rect
+                // fill; non-solid brushes and combine/invert rops are logged
+                // and skipped rather than mis-painted. Brush wire (packed):
+                // brush_type u32 [+ color u32 when SOLID].
+                let Some((surface_id, bbox, off)) = parse_draw_base(data) else {
+                    warn!("DrawFill: truncated base ({} bytes)", data.len());
+                    return Ok(());
+                };
+                if off + 8 > data.len() {
+                    warn!("DrawFill: truncated brush");
+                    return Ok(());
+                }
+                let rd_u32 = |o: usize| {
+                    u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                };
+                let brush_type = rd_u32(off);
+                if brush_type != BrushType::Solid as u32 {
+                    debug!("DrawFill: brush type {brush_type} not implemented, skipping");
+                    return Ok(());
+                }
+                let color = rd_u32(off + 4); // 0x00RRGGBB in the surface's 32bpp format
+                let rop = if off + 10 <= data.len() {
+                    u16::from_le_bytes([data[off + 8], data[off + 9]])
+                } else {
+                    0
+                };
+                if !ropd_is_plain_copy(rop) {
+                    debug!("DrawFill: rop {rop:#06x} not a plain copy, skipping");
+                    return Ok(());
+                }
+                // Surface stores RGBA; the BGRx wire packs to 0x00RRGGBB (see
+                // the raw-bitmap 32BIT path), so split the color the same way.
+                let rgba = [
+                    ((color >> 16) & 0xff) as u8,
+                    ((color >> 8) & 0xff) as u8,
+                    (color & 0xff) as u8,
+                    255,
+                ];
+                self.fill_rect(surface_id, &bbox, rgba);
             }
             x if x == DisplayChannelMessage::DrawCopy as u16 => {
-                // HAVEN: explicit wire parse. Upstream's binrw SpiceDrawCopy uses
-                // 64-bit pointers, spurious padding and a fixed-size clip — none
-                // match the SPICE wire (verified by hex capture against QEMU).
-                // Layout (little-endian):
-                //   surface_id u32 | box Rect{top,left,bottom,right} (16)
-                //   | clip.type u8 [+ u32 clip-data ptr if RECTS]
-                //   | src_image u32 (offset into this message body)
-                //   | src_area Rect (16) | rop u16 | scale u8 | mask ...
-                // SPICE wire pointers are 32-bit offsets into the body (@ptr32).
-                if data.len() < 41 {
-                    warn!("DrawCopy message too short: {} bytes", data.len());
+                // SpiceCopy = base + src_image @ptr32 + src_area Rect + rop u16
+                // + scale u8 + mask. parse_draw_base covers the base (the RECTS
+                // clip is inline, not a pointer; the old "skip a 32-bit pointer"
+                // mis-parsed every clipped DrawCopy — scroll repaints — as
+                // src_image=0 → garbage). SPICE wire pointers are 32-bit body
+                // offsets (@ptr32).
+                let Some((surface_id, bbox, off)) = parse_draw_base(data) else {
+                    warn!("DrawCopy: truncated base ({} bytes)", data.len());
+                    return Ok(());
+                };
+                if off + 20 > data.len() {
+                    warn!("DrawCopy truncated before src_area");
                     return Ok(());
                 }
                 let rd_i32 = |o: usize| {
                     i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
                 };
-                let rd_u32 = |o: usize| {
-                    u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                let src_image =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                let src_area = SpiceRect {
+                    top: rd_i32(off + 4),
+                    left: rd_i32(off + 8),
+                    bottom: rd_i32(off + 12),
+                    right: rd_i32(off + 16),
                 };
-                let surface_id = rd_u32(0);
-                let bbox = SpiceRect {
-                    top: rd_i32(4),
-                    left: rd_i32(8),
-                    bottom: rd_i32(12),
-                    right: rd_i32(16),
-                };
-                let clip_type = data[20];
-                let mut off = 21usize;
-                if clip_type == ClipType::Rects as u8 {
-                    // HAVEN: a RECTS clip is stored INLINE here, not via a
-                    // pointer: num_rects u32 followed by num_rects * SpiceRect
-                    // (16 bytes each). Verified by wire capture against QEMU
-                    // (src_bitmap offset = 21 + 4 + num_rects*16). The previous
-                    // "skip a 32-bit pointer" mis-parsed every clipped DrawCopy
-                    // (e.g. scroll repaints) as src_image=0 → garbage decode.
-                    if off + 4 > data.len() {
-                        warn!("DrawCopy truncated in clip header");
-                        return Ok(());
+                match self.decode_image_at(data, src_image)? {
+                    Some((image_data, w, h)) => {
+                        self.blit_image_to_surface(surface_id, &image_data, w, h, &src_area, &bbox);
                     }
-                    let num_rects = rd_u32(off) as usize;
-                    off += 4 + num_rects * 16;
+                    None => warn!(
+                        "DrawCopy: could not decode source image at offset {src_image} (surface {surface_id})"
+                    ),
                 }
+            }
+            x if x == DisplayChannelMessage::DrawOpaque as u16 => {
+                // SpiceOpaque = base + src_image @ptr32 + src_area Rect + brush
+                // + rop u16 + scale + mask. OPAQUE paints the brush then the
+                // image; under a plain (PUT) rop the image fully covers the
+                // brushed bbox, so it reduces to a DrawCopy blit. The leading
+                // src_image + src_area share DrawCopy's layout exactly.
+                let Some((surface_id, bbox, off)) = parse_draw_base(data) else {
+                    warn!("DrawOpaque: truncated base ({} bytes)", data.len());
+                    return Ok(());
+                };
                 if off + 20 > data.len() {
-                    warn!("DrawCopy truncated before src_area");
+                    warn!("DrawOpaque truncated before src_area");
                     return Ok(());
                 }
-                let src_image = rd_u32(off) as usize;
-                off += 4;
-                let src_area = SpiceRect {
-                    top: rd_i32(off),
-                    left: rd_i32(off + 4),
-                    bottom: rd_i32(off + 8),
-                    right: rd_i32(off + 12),
+                let rd_i32 = |o: usize| {
+                    i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
                 };
-
-                let decoded_image = self.decode_image_at(data, src_image)?;
-
-                if let Some(surface) = self.surfaces.get_mut(&surface_id) {
-                    match decoded_image {
-                        Some((image_data, img_width, img_height)) => {
-                            let bytes_per_pixel = 4;
-                            let surface_stride = surface.width as usize * bytes_per_pixel;
-                            let image_stride = img_width as usize * bytes_per_pixel;
-
-                            let src_left = src_area.left.max(0) as usize;
-                            let src_top = src_area.top.max(0) as usize;
-                            let src_right = src_area.right.min(img_width as i32) as usize;
-                            let src_bottom = src_area.bottom.min(img_height as i32) as usize;
-
-                            let dst_left = bbox.left.max(0) as usize;
-                            let dst_top = bbox.top.max(0) as usize;
-                            let dst_right = bbox.right.min(surface.width as i32) as usize;
-                            let dst_bottom = bbox.bottom.min(surface.height as i32) as usize;
-
-                            // saturating_sub: dst/src rects may exceed the surface.
-                            let copy_width = src_right
-                                .saturating_sub(src_left)
-                                .min(dst_right.saturating_sub(dst_left));
-                            let copy_height = src_bottom
-                                .saturating_sub(src_top)
-                                .min(dst_bottom.saturating_sub(dst_top));
-
-                            for y in 0..copy_height {
-                                let src_y = src_top + y;
-                                let dst_y = dst_top + y;
-                                if src_y < img_height as usize && dst_y < surface.height as usize {
-                                    let src_row_offset = src_y * image_stride;
-                                    let dst_row_offset = dst_y * surface_stride;
-                                    for x in 0..copy_width {
-                                        let src_x = src_left + x;
-                                        let dst_x = dst_left + x;
-                                        if src_x < img_width as usize
-                                            && dst_x < surface.width as usize
-                                        {
-                                            let so = src_row_offset + src_x * bytes_per_pixel;
-                                            let dofs = dst_row_offset + dst_x * bytes_per_pixel;
-                                            if so + 4 <= image_data.len()
-                                                && dofs + 4 <= surface.data.len()
-                                            {
-                                                surface.data[dofs..dofs + 4]
-                                                    .copy_from_slice(&image_data[so..so + 4]);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            self.notify_update(surface_id);
-                        }
-                        None => {
-                            warn!(
-                                "DrawCopy: could not decode source image at offset {} (surface {})",
-                                src_image, surface_id
-                            );
-                        }
+                let src_image =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                let src_area = SpiceRect {
+                    top: rd_i32(off + 4),
+                    left: rd_i32(off + 8),
+                    bottom: rd_i32(off + 12),
+                    right: rd_i32(off + 16),
+                };
+                match self.decode_image_at(data, src_image)? {
+                    Some((image_data, w, h)) => {
+                        self.blit_image_to_surface(surface_id, &image_data, w, h, &src_area, &bbox);
                     }
+                    None => warn!(
+                        "DrawOpaque: could not decode source image at offset {src_image} (surface {surface_id})"
+                    ),
                 }
             }
             _ => {
@@ -1864,6 +2020,93 @@ mod tests {
         let mut out = vec![0u8; 4 * 4];
         let window: HashMap<u64, GlzImage> = HashMap::new();
         assert!(glz_decode_body(&window, &body, &mut out, 4, 1, false).is_none());
+    }
+
+    // --- Phase F draw ops ---------------------------------------------------
+
+    #[test]
+    fn ropd_plain_copy_classification() {
+        const OP_PUT: u16 = 1 << 3;
+        assert!(ropd_is_plain_copy(OP_PUT)); // straight put
+        assert!(ropd_is_plain_copy(0)); // unspecified = treat as copy
+        assert!(!ropd_is_plain_copy(OP_PUT | (1 << 6))); // + XOR
+        assert!(!ropd_is_plain_copy(OP_PUT | (1 << 0))); // + INVERS_SRC
+        assert!(!ropd_is_plain_copy(1 << 9)); // OP_INVERS
+    }
+
+    #[test]
+    fn parse_draw_base_none_clip() {
+        // surface_id=7, bbox{top=1,left=2,bottom=3,right=4}, clip NONE.
+        let mut d = Vec::new();
+        d.extend_from_slice(&7u32.to_le_bytes());
+        for v in [1i32, 2, 3, 4] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.push(ClipType::None as u8);
+        let (sid, bbox, off) = parse_draw_base(&d).expect("base");
+        assert_eq!(sid, 7);
+        assert_eq!((bbox.top, bbox.left, bbox.bottom, bbox.right), (1, 2, 3, 4));
+        assert_eq!(off, 21); // clip is just the 1-byte type
+    }
+
+    #[test]
+    fn parse_draw_base_rects_clip_is_inline() {
+        // RECTS clip with 2 rects -> off advances past num_rects(4)+2*16.
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&[0u8; 16]); // bbox
+        d.push(ClipType::Rects as u8);
+        d.extend_from_slice(&2u32.to_le_bytes()); // num_rects
+        d.extend_from_slice(&[0u8; 32]); // 2 * Rect(16)
+        let (_, _, off) = parse_draw_base(&d).expect("base");
+        assert_eq!(off, 21 + 4 + 32);
+    }
+
+    #[test]
+    fn fill_surface_rect_writes_clamped_rgba() {
+        let mut s = DisplaySurface { width: 4, height: 4, format: 32, data: vec![0u8; 4 * 4 * 4] };
+        // Fill {top=1,left=1,bottom=3,right=3} -> a 2x2 block at (1,1).
+        let rect = SpiceRect { top: 1, left: 1, bottom: 3, right: 3 };
+        fill_surface_rect(&mut s, &rect, [10, 20, 30, 255]);
+        let px = |x: usize, y: usize| {
+            let o = (y * 4 + x) * 4;
+            &s.data[o..o + 4]
+        };
+        assert_eq!(px(1, 1), &[10, 20, 30, 255]);
+        assert_eq!(px(2, 2), &[10, 20, 30, 255]);
+        assert_eq!(px(0, 0), &[0, 0, 0, 0]); // outside the rect untouched
+        assert_eq!(px(3, 3), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn fill_surface_rect_clamps_out_of_bounds() {
+        let mut s = DisplaySurface { width: 2, height: 2, format: 32, data: vec![0u8; 2 * 2 * 4] };
+        // Rect exceeds the surface; must clamp, not panic or overflow.
+        let rect = SpiceRect { top: -5, left: -5, bottom: 100, right: 100 };
+        fill_surface_rect(&mut s, &rect, [9, 9, 9, 255]);
+        assert!(s.data.chunks_exact(4).all(|p| p == [9, 9, 9, 255]));
+    }
+
+    #[test]
+    fn blit_to_surface_copies_src_area_into_bbox() {
+        // 2x2 source image, distinct pixels; blit fully into a 4x4 surface at (1,1).
+        let img: Vec<u8> = vec![
+            1, 1, 1, 255, 2, 2, 2, 255, // row 0
+            3, 3, 3, 255, 4, 4, 4, 255, // row 1
+        ];
+        let mut s = DisplaySurface { width: 4, height: 4, format: 32, data: vec![0u8; 4 * 4 * 4] };
+        let src = SpiceRect { top: 0, left: 0, bottom: 2, right: 2 };
+        let bbox = SpiceRect { top: 1, left: 1, bottom: 3, right: 3 };
+        blit_to_surface(&mut s, &img, 2, 2, &src, &bbox);
+        let px = |x: usize, y: usize| {
+            let o = (y * 4 + x) * 4;
+            &s.data[o..o + 4]
+        };
+        assert_eq!(px(1, 1), &[1, 1, 1, 255]);
+        assert_eq!(px(2, 1), &[2, 2, 2, 255]);
+        assert_eq!(px(1, 2), &[3, 3, 3, 255]);
+        assert_eq!(px(2, 2), &[4, 4, 4, 255]);
+        assert_eq!(px(0, 0), &[0, 0, 0, 0]); // outside bbox untouched
     }
 
     #[test]
