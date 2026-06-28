@@ -1058,7 +1058,17 @@ impl DisplayChannel {
         loop {
             match self.connection.read_message().await {
                 Ok((header, data)) => {
-                    self.handle_message(&header, &data).await?;
+                    // HAVEN: a single message's parse/decode failure must NOT
+                    // tear down the channel. The display task is spawned and its
+                    // JoinHandle error is never checked, so a fatal `?` here
+                    // silently stops all rendering while the socket stays open
+                    // (bytes pile up unread). Log and keep reading instead.
+                    if let Err(e) = self.handle_message(&header, &data).await {
+                        warn!(
+                            "DisplayChannel: handling msg type {} failed: {e} — skipping",
+                            header.msg_type
+                        );
+                    }
                     // SPICE ACK flow control: replenish the server's send window
                     // every `ack_window` messages, else it stalls after one window.
                     if self.ack_window > 0 {
@@ -1146,7 +1156,18 @@ impl DisplayChannel {
                 let clip_type = data[20];
                 let mut off = 21usize;
                 if clip_type == ClipType::Rects as u8 {
-                    off += 4; // skip the 32-bit clip-data pointer
+                    // HAVEN: a RECTS clip is stored INLINE here, not via a
+                    // pointer: num_rects u32 followed by num_rects * SpiceRect
+                    // (16 bytes each). Verified by wire capture against QEMU
+                    // (src_bitmap offset = 21 + 4 + num_rects*16). The previous
+                    // "skip a 32-bit pointer" mis-parsed every clipped DrawCopy
+                    // (e.g. scroll repaints) as src_image=0 → garbage decode.
+                    if off + 4 > data.len() {
+                        warn!("DrawCopy truncated in clip header");
+                        return Ok(());
+                    }
+                    let num_rects = rd_u32(off) as usize;
+                    off += 4 + num_rects * 16;
                 }
                 if off + 20 > data.len() {
                     warn!("DrawCopy truncated before src_area");
@@ -1315,18 +1336,21 @@ impl Channel for DisplayChannel {
                 self.handle_mode_message(data).await?;
             }
             x if x == DisplayChannelMessage::Mark as u16 => {
-                debug!("Received display mark");
-
-                // Parse the mark message
-                let mut cursor = std::io::Cursor::new(data);
-                let mark_msg = SpiceMsgDisplayMark::read(&mut cursor).map_err(|e| {
-                    SpiceError::Protocol(format!("Failed to parse DisplayMark: {e}"))
-                })?;
-
-                info!("Display mark received: {}", mark_msg.mark);
+                // HAVEN: QEMU sends MARK with an empty body (0 bytes); some
+                // servers carry a u32 mark. Parse the mark only if present —
+                // failing here used to abort the whole display task (the
+                // "streaming gap": one bad message killed run(), the socket
+                // stayed open held by `inner`, and all later draws piled up
+                // unread). Never let MARK be fatal.
+                let mark = if data.len() >= 4 {
+                    u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+                } else {
+                    0
+                };
+                debug!("Received display mark: {mark}");
 
                 // Store the mark for synchronization tracking
-                self.last_mark = Some(mark_msg.mark);
+                self.last_mark = Some(mark);
 
                 // According to the protocol, we should expose the display content after receiving a mark
                 // Notify any update callbacks about the current surface state

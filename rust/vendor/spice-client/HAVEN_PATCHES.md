@@ -67,22 +67,42 @@ structs that ARE read live (`SpiceMsgSurfaceCreate/Destroy`, `SpiceMonitorsConfi
 - **`SpiceRect` test** (`protocol/tests.rs`): updated to assert the corrected
   `{top,left,bottom,right}` wire order.
 
-## KNOWN BLOCKER: no incremental display updates (streaming gap)
-Empirically, this client receives only the **initial paint** (SET_ACK, INVAL,
-SURFACE_CREATE, one DRAW_COPY, MARK) and then **no further display messages** —
-confirmed across an off/lz/auto_glz QEMU and a live Windows desktop, with the
-client socket `Recv-Q` staying 0 (the server is not sending more). So the gap is
-client-side: something a real client (spice-gtk) sends to keep the server
-streaming is missing. ACK windowing and per-message ACK were both tried and did
-NOT unblock it. This blocks live validation of GLZ/QUIC/cache (they only exercise
-on incremental updates) AND would make the on-device client show only the first
-frame. Needs diffing against real spice-gtk wire traffic to find the missing
-client message(s). The crate's "transport works" only ever covered frame 1.
+## RESOLVED: the "streaming gap" was a client-side fatal MARK parse
+Earlier this client appeared to receive only the **initial paint** and no
+incremental updates. Root cause (found by a logging proxy + `Recv-Q` capture
+against a default `auto_glz` QEMU): the `MSG_DISPLAY_MARK` (type 102) arrives
+with an **empty (0-byte) body**, but `SpiceMsgDisplayMark::read` required bytes →
+returned `Err` → `?` propagated out of `handle_message` **and out of `run()`**.
+The display task is `tokio::spawn`ed and its `JoinHandle` error is never checked,
+so the task **died silently** while the socket stayed open (held by `inner`); all
+later display bytes then piled up unread (`Recv-Q` observed climbing to ~80 KB
+during a screen change). The earlier "Recv-Q stays 0 / server isn't sending"
+reading was wrong — the server *was* streaming. Two fixes:
+- **MARK tolerates an empty/short body** (`display.rs`): parse the `u32` mark only
+  when ≥4 bytes are present, else mark=0. Never fatal.
+- **`run()` makes per-message handling non-fatal** (`display.rs`): a single
+  message's parse/decode error is now `warn!`-logged and skipped instead of
+  tearing down the whole channel. (read/IO errors still end the loop.)
+- **DRAW_COPY clip RECTS is inline, not a pointer** (`display.rs`): a `RECTS` clip
+  is `num_rects u32` + `num_rects * SpiceRect(16)` stored inline between
+  `clip.type` and the `src_bitmap` @ptr32 — not a 4-byte pointer. The old code
+  skipped 4 bytes → read `src_image=0` → decoded garbage for every clipped
+  DRAW_COPY (e.g. scroll repaints). Verified by wire capture (`src_bitmap` offset
+  = 21 + 4 + num_rects*16).
+
+Verified end-to-end against default `auto_glz` QEMU (Ubuntu installer): a QMP
+wheel-scroll of the language list streams incremental DRAW_COPY repaints that
+decode pixel-correct (3 frames, `Recv-Q` stays 0, no decode warnings). NB the
+repaints arrive as **LZ_RGB (101)**, so this validates the LZ path on incremental
+frames; **GLZ (102) real-traffic validation is still pending** a
+`image-compression=glz`-forced server (GLZ currently covered only by unit tests).
 
 ## TODO (in progress)
-- **Resolve the streaming gap above (highest priority — gates everything).**
+- GLZ (102) real-traffic validation against a `glz`-forced QEMU.
 - ZLIB_GLZ_RGB (107) / QUIC (1) / LZ4 (109) image decoders.
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
 - Cursor channel shapes; multi-surface; remaining draw ops (FILL/OPAQUE/COPY_BITS).
+- `MSG_PING` (type 4, 12-byte body) currently logged-and-skipped; add PONG if a
+  server starts disconnecting idle clients.
 
 Upstream these once stabilised.
