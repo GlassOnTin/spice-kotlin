@@ -7,6 +7,120 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+/// Decode a SPICE cursor shape into opaque-or-alpha RGBA (`width*height*4`).
+/// Returns None for unsupported types or truncated input. Free fn so it's
+/// unit-testable without a live channel.
+///
+/// - ALPHA: 32bpp premultiplied BGRA on the wire (Cairo ARGB32, LE) → RGBA.
+/// - MONO: two stacked 1bpp bitmaps, AND mask then XOR mask. Per Windows
+///   semantics: AND=1,XOR=0 transparent; AND=0,XOR=0 black; AND=0,XOR=1 white;
+///   AND=1,XOR=1 (screen invert) rendered black (best effort without the
+///   framebuffer underneath).
+/// - COLOR4/8/16/24/32 are not implemented.
+fn decode_cursor_shape(type_: u8, width: u16, height: u16, raw: &[u8]) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    match type_ {
+        SPICE_CURSOR_TYPE_ALPHA => {
+            let need = w * h * 4;
+            if raw.len() < need {
+                return None;
+            }
+            let mut out = Vec::with_capacity(need);
+            for px in raw[..need].chunks_exact(4) {
+                out.push(px[2]); // R
+                out.push(px[1]); // G
+                out.push(px[0]); // B
+                out.push(px[3]); // A
+            }
+            Some(out)
+        }
+        SPICE_CURSOR_TYPE_MONO => {
+            let stride = w.div_ceil(8);
+            let need = stride * h * 2; // AND mask then XOR mask
+            if raw.len() < need {
+                return None;
+            }
+            let and = &raw[..stride * h];
+            let xor = &raw[stride * h..need];
+            let mut out = vec![0u8; w * h * 4];
+            for y in 0..h {
+                for x in 0..w {
+                    let byte = y * stride + x / 8;
+                    let bit = 7 - (x % 8);
+                    let a = (and[byte] >> bit) & 1;
+                    let xo = (xor[byte] >> bit) & 1;
+                    let (r, g, b, al) = match (a, xo) {
+                        (1, 0) => (0, 0, 0, 0),         // transparent
+                        (0, 0) => (0, 0, 0, 255),       // black
+                        (0, 1) => (255, 255, 255, 255), // white
+                        _ => (0, 0, 0, 255),            // invert → black (best effort)
+                    };
+                    let o = (y * w + x) * 4;
+                    out[o] = r;
+                    out[o + 1] = g;
+                    out[o + 2] = b;
+                    out[o + 3] = al;
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Fixed-layout fields of a CURSOR_SET message body (packed wire). The shape
+/// header (offset 7..24) is only meaningful when `flags` lacks NONE and the
+/// buffer is at least 24 bytes; the pixel data then starts at offset 24.
+struct CursorSetFields {
+    pos: (i32, i32),
+    visible: bool,
+    flags: u16,
+    unique: u64,
+    type_: u8,
+    width: u16,
+    height: u16,
+    hot_spot_x: u16,
+    hot_spot_y: u16,
+}
+
+/// Parse the CURSOR_SET prefix (position + visible + flags) and, when present,
+/// the 17-byte shape header. Returns None only if the 7-byte prefix is missing;
+/// header fields stay zero unless the full 24-byte header is present. Free fn so
+/// the wire offsets are unit-testable without a live channel.
+fn parse_cursor_set(data: &[u8]) -> Option<CursorSetFields> {
+    if data.len() < 7 {
+        return None;
+    }
+    let x = i16::from_le_bytes([data[0], data[1]]) as i32;
+    let y = i16::from_le_bytes([data[2], data[3]]) as i32;
+    let mut f = CursorSetFields {
+        pos: (x, y),
+        visible: data[4] != 0,
+        flags: u16::from_le_bytes([data[5], data[6]]),
+        unique: 0,
+        type_: 0,
+        width: 0,
+        height: 0,
+        hot_spot_x: 0,
+        hot_spot_y: 0,
+    };
+    if data.len() >= 24 {
+        f.unique = u64::from_le_bytes([
+            data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14],
+        ]);
+        f.type_ = data[15];
+        f.width = u16::from_le_bytes([data[16], data[17]]);
+        f.height = u16::from_le_bytes([data[18], data[19]]);
+        f.hot_spot_x = u16::from_le_bytes([data[20], data[21]]);
+        f.hot_spot_y = u16::from_le_bytes([data[22], data[23]]);
+    }
+    Some(f)
+}
+
 /// Cursor shape data
 #[derive(Debug, Clone)]
 pub struct CursorShape {
@@ -171,49 +285,70 @@ impl CursorChannel {
     }
 
     async fn handle_cursor_set(&mut self, data: &[u8]) -> Result<()> {
-        if data.len() >= 17 {
-            let cursor_header = SpiceCursorHeader {
-                unique: u64::from_le_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]),
-                type_: data[8],
-                width: u16::from_le_bytes([data[9], data[10]]),
-                height: u16::from_le_bytes([data[11], data[12]]),
-                hot_spot_x: u16::from_le_bytes([data[13], data[14]]),
-                hot_spot_y: u16::from_le_bytes([data[15], data[16]]),
-            };
+        // SpiceMsgCursorSet (packed wire):
+        //   position Point16 {x i16, y i16} | visible u8 | cursor {
+        //     flags u16 | [ header(17) | data[] ] }
+        // The header is only present when flags != NONE; pixel data follows it
+        // unless FROM_CACHE. Header(17) = unique u64, type u8, width u16,
+        // height u16, hot_spot_x u16, hot_spot_y u16. So pixels start at byte 24.
+        let Some(f) = parse_cursor_set(data) else {
+            warn!("CURSOR_SET too short: {} bytes", data.len());
+            return Ok(());
+        };
+        self.cursor_position = f.pos;
+        self.cursor_visible = f.visible;
 
-            let data_offset = 17;
-            let data_size = (cursor_header.width * cursor_header.height * 4) as usize;
-
-            if data.len() >= data_offset + data_size {
-                let cursor_data = data[data_offset..data_offset + data_size].to_vec();
-
-                let cursor_shape = CursorShape {
-                    width: cursor_header.width,
-                    height: cursor_header.height,
-                    hot_spot_x: cursor_header.hot_spot_x,
-                    hot_spot_y: cursor_header.hot_spot_y,
-                    data: cursor_data,
-                    mask: None,
-                };
-
-                // Cache the cursor
-                self.cursor_cache
-                    .insert(cursor_header.unique, cursor_shape.clone());
-                self.current_cursor = Some(cursor_shape);
-
-                info!(
-                    "Set cursor - {}x{}, hotspot: ({}, {})",
-                    cursor_header.width,
-                    cursor_header.height,
-                    cursor_header.hot_spot_x,
-                    cursor_header.hot_spot_y
-                );
-
-                self.notify_cursor_update();
-            }
+        if f.flags & SPICE_CURSOR_FLAGS_NONE != 0 {
+            // No shape — empty/hidden cursor.
+            self.current_cursor = None;
+            self.notify_cursor_update();
+            return Ok(());
         }
+        if data.len() < 24 {
+            warn!("CURSOR_SET truncated header: {} bytes", data.len());
+            return Ok(());
+        }
+
+        let shape = if f.flags & SPICE_CURSOR_FLAGS_FROM_CACHE != 0 {
+            match self.cursor_cache.get(&f.unique) {
+                Some(s) => s.clone(),
+                None => {
+                    warn!("CURSOR_SET FROM_CACHE miss for unique {}", f.unique);
+                    return Ok(());
+                }
+            }
+        } else {
+            match decode_cursor_shape(f.type_, f.width, f.height, &data[24..]) {
+                Some(rgba) => {
+                    let s = CursorShape {
+                        width: f.width,
+                        height: f.height,
+                        hot_spot_x: f.hot_spot_x,
+                        hot_spot_y: f.hot_spot_y,
+                        data: rgba,
+                        mask: None,
+                    };
+                    if f.flags & SPICE_CURSOR_FLAGS_CACHE_ME != 0 {
+                        self.cursor_cache.insert(f.unique, s.clone());
+                    }
+                    s
+                }
+                None => {
+                    warn!(
+                        "CURSOR_SET: type {} ({}x{}) not decoded, skipping",
+                        f.type_, f.width, f.height
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        info!(
+            "Set cursor - {}x{} type {}, hotspot ({}, {})",
+            shape.width, shape.height, f.type_, shape.hot_spot_x, shape.hot_spot_y
+        );
+        self.current_cursor = Some(shape);
+        self.notify_cursor_update();
         Ok(())
     }
 
@@ -432,5 +567,91 @@ mod tests {
 
         assert_eq!(x, 16);
         assert_eq!(y, 32);
+    }
+
+    #[test]
+    fn decode_alpha_cursor_bgra_to_rgba() {
+        // 1x1 ALPHA cursor; wire is premultiplied BGRA -> expect RGBA.
+        let raw = [0x10u8, 0x20, 0x30, 0x40]; // B=0x10 G=0x20 R=0x30 A=0x40
+        let out = decode_cursor_shape(SPICE_CURSOR_TYPE_ALPHA, 1, 1, &raw).unwrap();
+        assert_eq!(out, vec![0x30, 0x20, 0x10, 0x40]);
+    }
+
+    #[test]
+    fn decode_alpha_cursor_truncated_is_none() {
+        // 2x2 needs 16 bytes; give 8 -> None, not a panic.
+        assert!(decode_cursor_shape(SPICE_CURSOR_TYPE_ALPHA, 2, 2, &[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn decode_mono_cursor_and_xor_semantics() {
+        // 8x1 MONO. stride=1, AND byte then XOR byte.
+        // AND=0b1100_0000, XOR=0b1010_0000 -> per pixel (x=0..7):
+        //  x0: AND1 XOR1 -> invert(black opaque)
+        //  x1: AND1 XOR0 -> transparent
+        //  x2: AND0 XOR1 -> white
+        //  x3..7: AND0 XOR0 -> black
+        let raw = [0b1100_0000u8, 0b1010_0000u8];
+        let out = decode_cursor_shape(SPICE_CURSOR_TYPE_MONO, 8, 1, &raw).unwrap();
+        let px = |x: usize| &out[x * 4..x * 4 + 4];
+        assert_eq!(px(0), &[0, 0, 0, 255]); // invert -> black opaque
+        assert_eq!(px(1), &[0, 0, 0, 0]); // transparent
+        assert_eq!(px(2), &[255, 255, 255, 255]); // white
+        assert_eq!(px(3), &[0, 0, 0, 255]); // black
+    }
+
+    #[test]
+    fn decode_color_cursor_unsupported_is_none() {
+        assert!(decode_cursor_shape(SPICE_CURSOR_TYPE_COLOR32, 4, 4, &[0u8; 64]).is_none());
+    }
+
+    #[test]
+    fn parse_cursor_set_alpha_offsets_then_decode() {
+        // Full CURSOR_SET ALPHA body for a 2x1 cursor; checks every wire offset
+        // (pos@0, visible@4, flags@5, unique@7, type@15, w@16, h@18, hot@20,
+        // pixels@24) and that the tail decodes BGRA->RGBA.
+        let mut d = Vec::new();
+        d.extend_from_slice(&7i16.to_le_bytes()); // x
+        d.extend_from_slice(&9i16.to_le_bytes()); // y
+        d.push(1); // visible
+        d.extend_from_slice(&SPICE_CURSOR_FLAGS_CACHE_ME.to_le_bytes());
+        d.extend_from_slice(&0xABCDu64.to_le_bytes()); // unique
+        d.push(SPICE_CURSOR_TYPE_ALPHA); // type
+        d.extend_from_slice(&2u16.to_le_bytes()); // width
+        d.extend_from_slice(&1u16.to_le_bytes()); // height
+        d.extend_from_slice(&1u16.to_le_bytes()); // hot_x
+        d.extend_from_slice(&0u16.to_le_bytes()); // hot_y
+        d.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x11, 0x22, 0x33, 0x44]); // 2px BGRA
+        assert_eq!(d.len(), 32);
+
+        let f = parse_cursor_set(&d).unwrap();
+        assert_eq!(f.pos, (7, 9));
+        assert!(f.visible);
+        assert_eq!(f.flags, SPICE_CURSOR_FLAGS_CACHE_ME);
+        assert_eq!(f.unique, 0xABCD);
+        assert_eq!(f.type_, SPICE_CURSOR_TYPE_ALPHA);
+        assert_eq!((f.width, f.height), (2, 1));
+        assert_eq!((f.hot_spot_x, f.hot_spot_y), (1, 0));
+
+        let rgba = decode_cursor_shape(f.type_, f.width, f.height, &d[24..]).unwrap();
+        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0x40, 0x33, 0x22, 0x11, 0x44]);
+    }
+
+    #[test]
+    fn parse_cursor_set_none_flag_prefix_only() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0i16.to_le_bytes());
+        d.extend_from_slice(&0i16.to_le_bytes());
+        d.push(0); // not visible
+        d.extend_from_slice(&SPICE_CURSOR_FLAGS_NONE.to_le_bytes());
+        let f = parse_cursor_set(&d).unwrap();
+        assert_eq!(f.flags, SPICE_CURSOR_FLAGS_NONE);
+        assert!(!f.visible);
+        assert_eq!(f.width, 0); // header absent -> zeroed
+    }
+
+    #[test]
+    fn parse_cursor_set_too_short_is_none() {
+        assert!(parse_cursor_set(&[0, 0, 0]).is_none());
     }
 }

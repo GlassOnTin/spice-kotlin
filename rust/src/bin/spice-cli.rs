@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use spice_client::{DisplaySurface, SpiceClientShared};
+use spice_client::{CursorShape, DisplaySurface, SpiceClientShared};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +55,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await
         .map_err(|e| format!("set_display_update_callback: {e}"))?;
+
+    // Cursor channel: log each decoded shape so the Phase-G render gate can
+    // confirm a plausible size/hotspot/non-empty RGBA. Non-fatal if absent.
+    let cursors = Arc::new(AtomicU64::new(0));
+    let cursors_cb = cursors.clone();
+    if let Err(e) = client
+        .set_cursor_update_callback(0, move |shape: &CursorShape, pos, visible| {
+            let n = cursors_cb.fetch_add(1, Ordering::Relaxed) + 1;
+            let nonzero = shape.data.iter().filter(|&&b| b != 0).count();
+            println!(
+                "spice-cli: cursor #{n} {}x{} hotspot ({},{}) pos ({},{}) visible={} rgba_bytes={} nonzero={}",
+                shape.width, shape.height, shape.hot_spot_x, shape.hot_spot_y,
+                pos.0, pos.1, visible, shape.data.len(), nonzero
+            );
+        })
+        .await
+    {
+        println!("spice-cli: no cursor channel ({e})");
+    }
 
     client.start_event_loop().await.map_err(|e| format!("start_event_loop: {e}"))?;
 

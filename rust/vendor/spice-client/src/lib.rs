@@ -213,4 +213,4 @@ pub use protocol::*;
 pub use video::{VideoFrame, VideoOutput};
 
 // Re-export commonly used types
-pub use channels::{DisplaySurface, InputEvent, KeyCode, MouseButton};
+pub use channels::{CursorShape, DisplaySurface, InputEvent, KeyCode, MouseButton};

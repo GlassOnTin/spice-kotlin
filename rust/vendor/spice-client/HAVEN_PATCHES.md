@@ -115,6 +115,31 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
     against a live Linux desktop yet — a composited GNOME/QXL-KMDOD guest sends mostly
     DRAW_COPY (LZ), so DRAW_FILL/OPAQUE need a 2D-drawing guest (X11 + xf86-video-qxl)
     to exercise on the wire.
+- **Cursor CURSOR_SET decode** (`src/channels/cursor.rs`, Phase G): rewrote
+  `handle_cursor_set` with the correct packed wire offsets — position Point16(4) |
+  visible u8 | flags u16 | [ header(17): unique u64, type u8, width u16, height u16,
+  hot_spot_x u16, hot_spot_y u16 ] | pixels @24. The fixed-header parse is a free
+  `parse_cursor_set` (unit-testable without a live channel) and shape decode is a free
+  `decode_cursor_shape`: **ALPHA (0)** = 32bpp premultiplied BGRA → RGBA; **MONO (1)** =
+  two stacked 1bpp bitmaps (stride `w.div_ceil(8)`, AND then XOR) composited to RGBA per
+  Windows semantics; COLOR4/8/16/24/32 return None (warn-and-skip). FLAGS handling:
+  NONE → no shape, FROM_CACHE → resolve by `unique`, CACHE_ME → store. Constants added to
+  `src/protocol.rs` (`SPICE_CURSOR_FLAGS_*` u16, `SPICE_CURSOR_TYPE_*` u8).
+  - Verified: 9 cursor unit tests (ALPHA BGRA→RGBA + truncation, MONO AND/XOR semantics,
+    COLOR unsupported, full CURSOR_SET offset parse incl. ALPHA tail decode, NONE-flag
+    prefix-only, too-short). **Not** validated against a live cursor-emitting guest — the
+    only live SPICE server to hand (a paused Win11 installer on :5902) renders a software
+    cursor during install and sent no hardware-cursor channel traffic in an 8s observe
+    window (display path itself confirmed: 4 correct 1024×768 frames). Re-check against a
+    booted desktop with a loaded QXL/virtio cursor driver when one is available.
+- **UniFFI cursor callback** (`spice-kotlin/rust/src/lib.rs`,
+  `vendor/.../client_shared.rs`): added `SpiceClientShared::set_cursor_update_callback`
+  (mirrors `set_display_update_callback`; must be wired before `start_event_loop` since
+  the cursor run loop then holds the channel lock). The wrapper exposes a `CursorCallback`
+  trait + `CursorData` record (RGBA shape + hotspot + position + visible) and wires it in
+  `connect()` after the frame callback. `spice-cli` logs each decoded cursor for the gate.
+  Known gap: `notify_cursor_update` only fires while a shape is set, so an explicit
+  FLAGS_NONE (cursor cleared) does not propagate to the callback.
 
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
@@ -182,8 +207,11 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 - FROM_CACHE (103) real-traffic check against a 2D-accel QXL guest (decode implemented;
   modern Windows QXL is display-only so no cache hints — see the FROM_CACHE entry above).
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
-- Cursor channel shapes; multi-surface. (FILL/OPAQUE/COPY_BITS draw ops done — Phase F.)
-- Live-wire validation of DRAW_FILL/DRAW_OPAQUE against a 2D-drawing Linux SPICE guest.
+- Multi-surface (SURFACE_CREATE/DESTROY) — Phase H. (Cursor shapes done — Phase G;
+  FILL/OPAQUE/COPY_BITS draw ops done — Phase F.)
+- COLOR4/8/16/24/32 cursor types (only ALPHA + MONO decoded so far).
+- Live-wire validation of DRAW_FILL/DRAW_OPAQUE (2D-drawing Linux SPICE guest) and of
+  CURSOR_SET (a booted guest with a hardware-cursor driver).
 - `MSG_PING` (type 4, 12-byte body) currently logged-and-skipped; add PONG if a
   server starts disconnecting idle clients.
 

@@ -434,6 +434,20 @@ pub const SPICE_MSG_CURSOR_TRAIL: u16 = 106;
 pub const SPICE_MSG_CURSOR_INVAL_ONE: u16 = 107;
 pub const SPICE_MSG_CURSOR_INVAL_ALL: u16 = 108;
 
+// Cursor shape flags (SpiceCursor.flags; enums.h SpiceCursorFlags)
+pub const SPICE_CURSOR_FLAGS_NONE: u16 = 1 << 0; // no shape in this message
+pub const SPICE_CURSOR_FLAGS_CACHE_ME: u16 = 1 << 1; // store this shape by `unique`
+pub const SPICE_CURSOR_FLAGS_FROM_CACHE: u16 = 1 << 2; // resolve shape by `unique`, no inline data
+
+// Cursor shape types (SpiceCursorHeader.type; enums.h SpiceCursorType)
+pub const SPICE_CURSOR_TYPE_ALPHA: u8 = 0; // 32bpp premultiplied BGRA
+pub const SPICE_CURSOR_TYPE_MONO: u8 = 1; // two 1bpp bitmaps: AND then XOR
+pub const SPICE_CURSOR_TYPE_COLOR4: u8 = 2;
+pub const SPICE_CURSOR_TYPE_COLOR8: u8 = 3;
+pub const SPICE_CURSOR_TYPE_COLOR16: u8 = 4;
+pub const SPICE_CURSOR_TYPE_COLOR24: u8 = 5;
+pub const SPICE_CURSOR_TYPE_COLOR32: u8 = 6;
+
 // Display channel messages - additional constants
 // Note: SPICE_MSG_DISPLAY_COPY_BITS is defined above as 104
 // Note: SPICE_MSG_DISPLAY_INVAL_PALETTE and SPICE_MSG_DISPLAY_INVAL_ALL_PALETTES

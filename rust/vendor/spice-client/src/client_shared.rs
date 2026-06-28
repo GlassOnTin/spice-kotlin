@@ -1023,4 +1023,26 @@ impl SpiceClientShared {
             )))
         }
     }
+
+    /// Sets a callback fired whenever the cursor shape, position, or visibility
+    /// changes. Must be called before `start_event_loop` (the cursor run loop
+    /// holds the channel lock once spawned). The callback receives the decoded
+    /// RGBA shape, position, and visibility.
+    pub async fn set_cursor_update_callback<F>(&self, channel_id: u8, callback: F) -> Result<()>
+    where
+        F: Fn(&CursorShape, (i32, i32), bool) + Send + Sync + 'static,
+    {
+        let inner = self.inner.lock().await;
+
+        if let Some(cursor_channel_arc) = inner.cursor_channels.get(&channel_id) {
+            let mut cursor_channel = cursor_channel_arc.lock().await;
+            cursor_channel.set_update_callback(Arc::new(callback));
+            Ok(())
+        } else {
+            Err(SpiceError::Protocol(format!(
+                "Cursor channel {} not connected",
+                channel_id
+            )))
+        }
+    }
 }

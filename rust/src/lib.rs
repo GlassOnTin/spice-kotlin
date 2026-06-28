@@ -11,7 +11,9 @@
 use std::sync::{Arc, Mutex};
 
 use log::{error, info};
-use spice_client::{DisplaySurface, MouseButton as SpiceMouseButton, SpiceClientShared};
+use spice_client::{
+    CursorShape, DisplaySurface, MouseButton as SpiceMouseButton, SpiceClientShared,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -78,6 +80,27 @@ pub trait FrameCallback: Send + Sync {
     fn on_frame(&self, frame: FrameData);
 }
 
+/// One hardware-cursor update: decoded RGBA shape plus position and visibility.
+/// `pixels` is `width*height*4` RGBA with alpha already composited from the
+/// wire ALPHA/MONO shape; empty when the cursor has no shape. Mirrors RDP's
+/// `onCursorUpdate`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CursorData {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+    pub pixels: Vec<u8>,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait CursorCallback: Send + Sync {
+    fn on_cursor(&self, cursor: CursorData);
+}
+
 /// Lifecycle + error surface, mirroring RDP's `SessionCallback`.
 #[uniffi::export(with_foreign)]
 pub trait SessionCallback: Send + Sync {
@@ -92,6 +115,7 @@ pub struct SpiceClient {
     config: SpiceConfig,
     inner: Mutex<Option<Arc<SpiceClientShared>>>,
     frame_cb: Mutex<Option<Arc<dyn FrameCallback>>>,
+    cursor_cb: Mutex<Option<Arc<dyn CursorCallback>>>,
     session_cb: Mutex<Option<Arc<dyn SessionCallback>>>,
 }
 
@@ -110,12 +134,17 @@ impl SpiceClient {
             config,
             inner: Mutex::new(None),
             frame_cb: Mutex::new(None),
+            cursor_cb: Mutex::new(None),
             session_cb: Mutex::new(None),
         })
     }
 
     pub fn set_frame_callback(&self, cb: Arc<dyn FrameCallback>) {
         *self.frame_cb.lock().unwrap() = Some(cb);
+    }
+
+    pub fn set_cursor_callback(&self, cb: Arc<dyn CursorCallback>) {
+        *self.cursor_cb.lock().unwrap() = Some(cb);
     }
 
     pub fn set_session_callback(&self, cb: Arc<dyn SessionCallback>) {
@@ -158,6 +187,20 @@ impl SpiceClient {
                 // Non-fatal: a server may number its display channel
                 // differently; log and continue (input/cursor may still work).
                 error!("set_display_update_callback failed: {}", e);
+            }
+        }
+
+        // Wire cursor updates before the run loop takes the channel lock.
+        if let Some(cb) = self.cursor_cb.lock().unwrap().clone() {
+            let res = self.rt.block_on(client.set_cursor_update_callback(
+                PRIMARY_CHANNEL,
+                move |shape: &CursorShape, pos: (i32, i32), visible: bool| {
+                    cb.on_cursor(cursor_to_data(shape, pos, visible));
+                },
+            ));
+            if let Err(e) = res {
+                // Non-fatal: a headless server may omit the cursor channel.
+                error!("set_cursor_update_callback failed: {}", e);
             }
         }
 
@@ -260,5 +303,20 @@ fn surface_to_frame(surface: &DisplaySurface) -> FrameData {
         width: surface.width as u16,
         height: surface.height as u16,
         pixels: surface.data.clone(),
+    }
+}
+
+/// Convert a decoded SPICE cursor shape + position/visibility into [CursorData].
+/// `shape.data` is already RGBA (alpha composited by the cursor channel).
+fn cursor_to_data(shape: &CursorShape, pos: (i32, i32), visible: bool) -> CursorData {
+    CursorData {
+        width: shape.width,
+        height: shape.height,
+        hot_x: shape.hot_spot_x,
+        hot_y: shape.hot_spot_y,
+        x: pos.0,
+        y: pos.1,
+        visible,
+        pixels: shape.data.clone(),
     }
 }
