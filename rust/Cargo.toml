@@ -1,0 +1,53 @@
+[package]
+name = "spice-transport"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "spice_transport"
+
+[dependencies]
+# Pure-Rust SPICE client (GPL-3.0; compatible with Haven's AGPL-3.0).
+spice-client = "0.2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+log = "0.4"
+android_logger = "0.15"
+uniffi = { version = "0.28", features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+# Host-side smoke driver for the same SpiceClient the Kotlin AAR uses.
+# Lets us validate the protocol against a real SPICE server without
+# rebuilding the AAR + redeploying to the device. Linux/macOS only.
+[[bin]]
+name = "spice-cli"
+path = "src/bin/spice-cli.rs"
+required-features = ["host-cli"]
+
+[features]
+default = []
+host-cli = ["env_logger"]
+
+[dependencies.env_logger]
+version = "0.11"
+optional = true
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+# Local fork of spice-client with Haven-specific fixes to its display path
+# (upstream 0.2.0's DRAW_COPY rect math underflows on off-surface bboxes,
+# panicking the display task — see vendor/spice-client/HAVEN_PATCHES.md).
+# Upstream in parallel; drop this patch once released.
+[patch.crates-io]
+spice-client = { path = "vendor/spice-client" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

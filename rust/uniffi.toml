@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "sh.haven.spice"
+cdylib_name = "spice_transport"
