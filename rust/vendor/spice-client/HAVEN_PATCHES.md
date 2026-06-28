@@ -57,6 +57,29 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
   - Verified: a `image-compression=glz`-forced Windows Server 2025 streams ~115
     GLZ_RGB images per LogonUI paint; all decode with **0 warnings** and the captured
     frame (login window, glyphs, password dots, cursor) is pixel-correct.
+- **ZLIB_GLZ_RGB decoder** (`decode_image_at` + `zlib_inflate`,
+  `src/channels/display.rs`): `SpiceZlibGlzRGBData` (packed) = `glz_data_size u32` +
+  `data_size u32` + zlib bytes. Inflate (flate2) then feed the result to `decode_glz`.
+  Verified: a server with `<zlib compression='always'/>` (qemu
+  `zlib-glz-wan-compression=always`) streams type-107 images mixed with GLZ — 80
+  ZLIB_GLZ decoded with **0 warnings**, inflated size matched `glz_data_size` exactly,
+  frame pixel-correct.
+- **Pixmap cache (FROM_CACHE) decode + CACHE_ME store** (`decode_image_at`,
+  `src/protocol.rs` flag consts): `DISPLAY_INIT` now enables the pixmap cache
+  (`cache_id=1`, `cache_size=32Mi`, spice-gtk defaults). `decode_image_at` reads the
+  descriptor `id`+`flags`, stores any decoded image flagged `SPICE_IMAGE_FLAGS_CACHE_ME`
+  in `image_cache` (keyed by id), and resolves `FROM_CACHE` (103) / `FROM_CACHE_LOSSLESS`
+  (106) by id (their wire body is empty). Server eviction (`INVAL_LIST`/`INVAL_ALL`) was
+  already handled. The `ImageCache` get/insert/remove is unit-tested.
+  - **NOT validated on real traffic.** The spice-server image cache is populated only
+    from guest QXL **2D drawing commands**, which modern Windows does not emit: its QXL
+    driver is a Display-**Only** Driver (KMDOD) — the framebuffer is *scraped* by the
+    server, not driven by 2D ops. Verified empirically: across glz/zlib-glz/off and
+    LogonUI/desktop/Explorer (~2100 images), incl. with the Red Hat QXL driver installed
+    (`Win32_VideoController` = "Red Hat QXL controller"), the server set `CACHE_ME`
+    **zero** times and never sent FROM_CACHE. Real FROM_CACHE needs a 2D-accel QXL guest
+    (Win7/XPDM or old Linux xf86-video-qxl). The decode path is correct by construction
+    but should be re-checked against such a guest if one becomes available.
 
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
@@ -118,7 +141,9 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 0 decode warnings, frame pixel-correct).
 
 ## TODO (in progress)
-- ZLIB_GLZ_RGB (107) / QUIC (1) / LZ4 (109) image decoders.
+- QUIC (1) / LZ4 (109) image decoders.
+- FROM_CACHE (103) real-traffic check against a 2D-accel QXL guest (decode implemented;
+  modern Windows QXL is display-only so no cache hints — see the FROM_CACHE entry above).
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
 - Cursor channel shapes; multi-surface; remaining draw ops (FILL/OPAQUE/COPY_BITS).
 - `MSG_PING` (type 4, 12-byte body) currently logged-and-skipped; add PONG if a

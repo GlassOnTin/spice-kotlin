@@ -833,6 +833,11 @@ pub const SPICE_IMAGE_TYPE_ZLIB_GLZ_RGB: u8 = 107;
 pub const SPICE_IMAGE_TYPE_JPEG_ALPHA: u8 = 108;
 pub const SPICE_IMAGE_TYPE_LZ4: u8 = 109;
 
+// SpiceImageDescriptor.flags (spice/enums.h SPICE_IMAGE_FLAGS_*).
+pub const SPICE_IMAGE_FLAGS_CACHE_ME: u8 = 1 << 0;
+pub const SPICE_IMAGE_FLAGS_HIGH_BITS_SET: u8 = 1 << 1;
+pub const SPICE_IMAGE_FLAGS_CACHE_REPLACE_ME: u8 = 1 << 2;
+
 // Bitmap format
 pub const SPICE_BITMAP_FMT_1BIT_LE: u8 = 1;
 pub const SPICE_BITMAP_FMT_1BIT_BE: u8 = 2;

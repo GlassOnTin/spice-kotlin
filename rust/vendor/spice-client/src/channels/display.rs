@@ -127,11 +127,11 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
-            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
-            // a non-zero GLZ dictionary window is REQUIRED for the server to send
-            // GLZ_RGB at all — our decoder maintains the matching glz_window.
-            cache_id: 0,
-            cache_size: 0,
+            // Pixmap cache (FROM_CACHE) and GLZ dictionary window both enabled.
+            // Sizes mirror spice-gtk defaults: 32Mi-pixel pixmap cache, 16Mi-1
+            // GLZ window. Server evicts via DISPLAY_INVAL_LIST / INVAL_ALL.
+            cache_id: 1,
+            cache_size: 1024 * 1024 * 32,
             glz_dict_id: 1,
             glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
@@ -210,11 +210,11 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
-            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
-            // a non-zero GLZ dictionary window is REQUIRED for the server to send
-            // GLZ_RGB at all — our decoder maintains the matching glz_window.
-            cache_id: 0,
-            cache_size: 0,
+            // Pixmap cache (FROM_CACHE) and GLZ dictionary window both enabled.
+            // Sizes mirror spice-gtk defaults: 32Mi-pixel pixmap cache, 16Mi-1
+            // GLZ window. Server evicts via DISPLAY_INVAL_LIST / INVAL_ALL.
+            cache_id: 1,
+            cache_size: 1024 * 1024 * 32,
             glz_dict_id: 1,
             glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
@@ -296,11 +296,11 @@ impl DisplayChannel {
         // For now, disable cache until we properly handle cache negotiation
         // The server is sending cached references without first sending the images
         let display_init = SpiceMsgcDisplayInit {
-            // Pixmap cache stays disabled (we don't resolve FROM_CACHE yet), but
-            // a non-zero GLZ dictionary window is REQUIRED for the server to send
-            // GLZ_RGB at all — our decoder maintains the matching glz_window.
-            cache_id: 0,
-            cache_size: 0,
+            // Pixmap cache (FROM_CACHE) and GLZ dictionary window both enabled.
+            // Sizes mirror spice-gtk defaults: 32Mi-pixel pixmap cache, 16Mi-1
+            // GLZ window. Server evicts via DISPLAY_INVAL_LIST / INVAL_ALL.
+            cache_id: 1,
+            cache_size: 1024 * 1024 * 32,
             glz_dict_id: 1,
             glz_dictionary_window_size: 1024 * 1024 * 16 - 1,
         };
@@ -478,7 +478,18 @@ impl DisplayChannel {
             );
             return Ok(None);
         }
+        let id = u64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
         let img_type = data[offset + 8];
+        let flags = data[offset + 9];
         let width = u32::from_le_bytes([
             data[offset + 10],
             data[offset + 11],
@@ -491,9 +502,11 @@ impl DisplayChannel {
             data[offset + 16],
             data[offset + 17],
         ]);
-        debug!("decode_image_at off={offset} type={img_type} {width}x{height}");
-        match img_type {
-            SPICE_IMAGE_TYPE_BITMAP => self.decode_bitmap_inline(data, offset + 18, width, height),
+        debug!("decode_image_at off={offset} id={id} type={img_type} flags={flags:#x} {width}x{height}");
+        let decoded = match img_type {
+            SPICE_IMAGE_TYPE_BITMAP => {
+                self.decode_bitmap_inline(data, offset + 18, width, height)?
+            }
             SPICE_IMAGE_TYPE_LZ_RGB => {
                 // BinaryData wrapper: data_size u32 LE @desc+18, LZ stream @desc+22.
                 let ds_off = offset + 18;
@@ -512,7 +525,7 @@ impl DisplayChannel {
                     return Ok(None);
                 }
                 let e = (s + data_size).min(data.len());
-                self.decode_lz(&data[s..e])
+                self.decode_lz(&data[s..e])?
             }
             SPICE_IMAGE_TYPE_GLZ_RGB => {
                 // Same BinaryData wrapper as LZ_RGB: data_size u32 LE @desc+18.
@@ -532,16 +545,75 @@ impl DisplayChannel {
                     return Ok(None);
                 }
                 let e = (s + data_size).min(data.len());
-                self.decode_glz(&data[s..e])
+                self.decode_glz(&data[s..e])?
+            }
+            SPICE_IMAGE_TYPE_ZLIB_GLZ_RGB => {
+                // SpiceZlibGlzRGBData (packed): glz_data_size u32 @desc+18, then a
+                // Data wrapper {data_size u32, zlib bytes}. Inflate -> GLZ stream.
+                let p = offset + 18;
+                if p + 8 > data.len() {
+                    warn!("ZLIB_GLZ_RGB header out of bounds");
+                    None
+                } else {
+                    let glz_data_size =
+                        u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]])
+                            as usize;
+                    let data_size = u32::from_le_bytes([
+                        data[p + 4],
+                        data[p + 5],
+                        data[p + 6],
+                        data[p + 7],
+                    ]) as usize;
+                    let s = p + 8;
+                    let e = (s + data_size).min(data.len());
+                    match zlib_inflate(&data[s..e]) {
+                        Some(glz) => {
+                            if glz.len() != glz_data_size {
+                                debug!(
+                                    "ZLIB_GLZ inflated {} bytes (expected {})",
+                                    glz.len(),
+                                    glz_data_size
+                                );
+                            }
+                            self.decode_glz(&glz)?
+                        }
+                        None => {
+                            warn!("ZLIB_GLZ inflate failed");
+                            None
+                        }
+                    }
+                }
+            }
+            SPICE_IMAGE_TYPE_FROM_CACHE | SPICE_IMAGE_TYPE_FROM_CACHE_LOSSLESS => {
+                // The body is empty; descriptor.id is the pixmap-cache key.
+                match self.image_cache.get(id) {
+                    Some(c) => Some((c.data.clone(), c.width, c.height)),
+                    None => {
+                        warn!(
+                            "FROM_CACHE miss: id {id} not cached ({} entries)",
+                            self.image_cache.len()
+                        );
+                        None
+                    }
+                }
             }
             other => {
                 warn!(
                     "HAVEN: image type {} ({}x{}) not yet supported",
                     other, width, height
                 );
-                Ok(None)
+                None
+            }
+        };
+        // Pixmap cache: store the decoded image under its id when the server flags
+        // CACHE_ME, so a later FROM_CACHE(id) re-blit resolves. Server eviction
+        // arrives via DISPLAY_INVAL_LIST / INVAL_ALL (handled in handle_message).
+        if flags & SPICE_IMAGE_FLAGS_CACHE_ME != 0 {
+            if let Some((px, w, h)) = &decoded {
+                self.image_cache.insert(id, px.clone(), *w, *h);
             }
         }
+        Ok(decoded)
     }
 
     /// HAVEN: decode a SPICE_IMAGE_TYPE_BITMAP whose pixel data is inline
@@ -894,6 +966,16 @@ impl DisplayChannel {
     ) -> Option<usize> {
         glz_decode_body(&self.glz_window, body, out, size, image_id, alpha_only)
     }
+}
+
+/// Inflate a raw zlib stream (used by ZLIB_GLZ_RGB to unwrap the GLZ stream).
+/// Returns None on any decompression error.
+fn zlib_inflate(input: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    ZlibDecoder::new(input).read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// GLZ LZSS inner loop (decode-glz-tmpl.c) for RGB24/RGB32 + the RGBA alpha
