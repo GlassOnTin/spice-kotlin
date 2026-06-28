@@ -56,6 +56,14 @@ impl ImageCache {
     }
 }
 
+/// A previously-decoded GLZ image kept in the global GLZ dictionary window.
+/// `data` is BGRX (4 bytes/pixel) in *encoder pixel order* (op order, not
+/// flipped) so cross-image back-references address it directly by pixel offset.
+struct GlzImage {
+    gross_pixels: usize,
+    data: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DisplaySurface {
     pub width: u32,
@@ -84,6 +92,14 @@ pub struct DisplayChannel {
     update_callback: Option<Box<dyn Fn(&DisplaySurface)>>,
     image_cache: ImageCache,
     last_mark: Option<u32>, // Track last received mark for synchronization
+    // Global GLZ dictionary window: decoded images keyed by image id, used to
+    // resolve cross-image back-references in later GLZ images.
+    glz_window: HashMap<u64, GlzImage>,
+    // SPICE ACK flow control: the server sends `ack_window` messages then waits
+    // for a SPICE_MSGC_ACK. Without periodic ACKs the channel stalls after the
+    // first window (only the initial paint arrives). 0 = no acking negotiated.
+    ack_window: u32,
+    ack_count: u32,
 }
 
 impl DisplayChannel {
@@ -157,6 +173,9 @@ impl DisplayChannel {
             update_callback: None,
             image_cache: ImageCache::new(),
             last_mark: None,
+            glz_window: HashMap::new(),
+            ack_window: 0,
+            ack_count: 0,
         })
     }
 
@@ -233,6 +252,9 @@ impl DisplayChannel {
             update_callback: None,
             image_cache: ImageCache::new(),
             last_mark: None,
+            glz_window: HashMap::new(),
+            ack_window: 0,
+            ack_count: 0,
         })
     }
 
@@ -312,6 +334,9 @@ impl DisplayChannel {
             update_callback: None,
             image_cache: ImageCache::new(),
             last_mark: None,
+            glz_window: HashMap::new(),
+            ack_window: 0,
+            ack_count: 0,
         })
     }
 
@@ -475,6 +500,26 @@ impl DisplayChannel {
                 }
                 let e = (s + data_size).min(data.len());
                 self.decode_lz(&data[s..e])
+            }
+            SPICE_IMAGE_TYPE_GLZ_RGB => {
+                // Same BinaryData wrapper as LZ_RGB: data_size u32 LE @desc+18.
+                let ds_off = offset + 18;
+                if ds_off + 4 > data.len() {
+                    warn!("GLZ_RGB data_size out of bounds");
+                    return Ok(None);
+                }
+                let data_size = u32::from_le_bytes([
+                    data[ds_off],
+                    data[ds_off + 1],
+                    data[ds_off + 2],
+                    data[ds_off + 3],
+                ]) as usize;
+                let s = offset + 22;
+                if s > data.len() {
+                    return Ok(None);
+                }
+                let e = (s + data_size).min(data.len());
+                self.decode_glz(&data[s..e])
             }
             other => {
                 warn!(
@@ -724,6 +769,265 @@ impl DisplayChannel {
         Ok(Some((rgba, width, height)))
     }
 
+    /// Decode a SPICE GLZ_RGB image stream (begins at the "LZ  " magic).
+    /// Port of spice-gtk decode-glz.c / decode-glz-tmpl.c. GLZ is LZSS over a
+    /// *global dictionary window* of previously-decoded images: back-references
+    /// may reach into earlier images (`self.glz_window`, keyed by image id).
+    /// Header (33 bytes, big-endian): magic, version, [type|top_down] u8,
+    /// width, height, stride, id u64, win_head_dist u32. Returns top-down RGBA.
+    fn decode_glz(&mut self, stream: &[u8]) -> Result<Option<(Vec<u8>, u32, u32)>> {
+        if stream.len() < 33 {
+            warn!("GLZ stream too short ({} bytes)", stream.len());
+            return Ok(None);
+        }
+        let be32 = |o: usize| {
+            u32::from_be_bytes([stream[o], stream[o + 1], stream[o + 2], stream[o + 3]])
+        };
+        let magic = be32(0);
+        if magic != 0x2020_5a4c {
+            warn!("GLZ bad magic {magic:#010x}");
+            return Ok(None);
+        }
+        let tmp = stream[8];
+        let lz_type = (tmp & 0x0f) as u32; // LZ_IMAGE_TYPE_MASK
+        let top_down = (tmp >> 4) != 0; // LZ_IMAGE_TYPE_LOG
+        let width = be32(9);
+        let height = be32(13);
+        let id = {
+            let hi = be32(21) as u64;
+            let lo = be32(25) as u64;
+            (hi << 32) | lo
+        };
+        let win_head_dist = be32(29);
+        let gross_pixels = width as usize * height as usize;
+        if gross_pixels == 0 || gross_pixels > 64 * 1024 * 1024 {
+            warn!("GLZ implausible size {width}x{height}");
+            return Ok(None);
+        }
+
+        // RGB24=7, RGB32=8, RGBA=9 decode to BGRX; RGBA carries an alpha pass.
+        let rgba_alpha = match lz_type {
+            7 | 8 => false,
+            9 => true,
+            6 => {
+                warn!("GLZ RGB16 sub-type not yet implemented");
+                return Ok(None);
+            }
+            other => {
+                warn!("GLZ image sub-type {other} not supported");
+                return Ok(None);
+            }
+        };
+
+        let mut bgrx = vec![0u8; gross_pixels * 4];
+        let consumed = match self.glz_decode_body(&stream[33..], &mut bgrx, gross_pixels, id, false) {
+            Some(c) => c,
+            None => {
+                warn!("GLZ rgb decompress failed/truncated (id {id})");
+                return Ok(None);
+            }
+        };
+        if rgba_alpha
+            && self
+                .glz_decode_body(&stream[33 + consumed..], &mut bgrx, gross_pixels, id, true)
+                .is_none()
+        {
+            warn!("GLZ alpha decompress failed (id {id})");
+            return Ok(None);
+        }
+        if !rgba_alpha {
+            for px in bgrx.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+
+        // Store in the window (encoder/op order, not flipped) for future refs.
+        self.glz_window.insert(
+            id,
+            GlzImage {
+                gross_pixels,
+                data: bgrx.clone(),
+            },
+        );
+        // Release images older than this frame's window head.
+        let oldest = id.saturating_sub(win_head_dist as u64);
+        self.glz_window.retain(|&k, _| k >= oldest);
+
+        // BGRX (op order) -> top-down RGBA surface.
+        let w = width as usize;
+        let h = height as usize;
+        let mut rgba = vec![0u8; gross_pixels * 4];
+        for y in 0..h {
+            let sy = if top_down { y } else { h - 1 - y };
+            for x in 0..w {
+                let s = (sy * w + x) * 4;
+                let d = (y * w + x) * 4;
+                rgba[d] = bgrx[s + 2];
+                rgba[d + 1] = bgrx[s + 1];
+                rgba[d + 2] = bgrx[s];
+                rgba[d + 3] = bgrx[s + 3];
+            }
+        }
+        Ok(Some((rgba, width, height)))
+    }
+
+    fn glz_decode_body(
+        &self,
+        body: &[u8],
+        out: &mut [u8],
+        size: usize,
+        image_id: u64,
+        alpha_only: bool,
+    ) -> Option<usize> {
+        glz_decode_body(&self.glz_window, body, out, size, image_id, alpha_only)
+    }
+}
+
+/// GLZ LZSS inner loop (decode-glz-tmpl.c) for RGB24/RGB32 + the RGBA alpha
+/// pass (`alpha_only`). `out` is 4-byte BGRX in op order. Back-references with
+/// `image_dist == 0` are within `out`; otherwise they resolve against
+/// `window[image_id - image_dist]`. Returns bytes consumed, or `None` on
+/// truncation / a reference that escapes its source.
+fn glz_decode_body(
+    window: &HashMap<u64, GlzImage>,
+    body: &[u8],
+    out: &mut [u8],
+    size: usize,
+    image_id: u64,
+    alpha_only: bool,
+) -> Option<usize> {
+    const MAX_COPY: u32 = 32;
+    let len_bias: u32 = if alpha_only { 2 } else { 0 };
+        let mut ip = 0usize;
+        let mut op = 0usize;
+        let mut ctrl = *body.get(ip)? as u32;
+        ip += 1;
+        loop {
+            if ctrl >= MAX_COPY {
+                let mut len = ctrl >> 5;
+                let mut pixel_flag = (ctrl >> 4) & 0x01;
+                let mut pixel_ofs = ctrl & 0x0f;
+                if len == 7 {
+                    loop {
+                        let code = *body.get(ip)? as u32;
+                        ip += 1;
+                        len += code;
+                        if code != 255 {
+                            break;
+                        }
+                    }
+                }
+                let code = *body.get(ip)? as u32;
+                ip += 1;
+                pixel_ofs += code << 4;
+
+                let code = *body.get(ip)? as u32;
+                ip += 1;
+                let image_flag = (code >> 6) & 0x03;
+                let image_dist;
+                if pixel_flag == 0 {
+                    let mut d = code & 0x3f;
+                    for i in 0..image_flag {
+                        let c = *body.get(ip)? as u32;
+                        ip += 1;
+                        d += c << (6 + 8 * i);
+                    }
+                    image_dist = d;
+                } else {
+                    pixel_flag = (code >> 5) & 0x01;
+                    pixel_ofs += (code & 0x1f) << 12;
+                    let mut d = 0u32;
+                    for i in 0..image_flag {
+                        let c = *body.get(ip)? as u32;
+                        ip += 1;
+                        d += c << (8 * i);
+                    }
+                    image_dist = d;
+                    if pixel_flag != 0 {
+                        let c = *body.get(ip)? as u32;
+                        ip += 1;
+                        pixel_ofs += c << 17;
+                    }
+                }
+
+                len += len_bias;
+                if image_dist == 0 {
+                    pixel_ofs += 1; // same-image offset biased by 1
+                }
+                let len = len as usize;
+
+                if image_dist == 0 {
+                    let po = pixel_ofs as usize;
+                    if po > op || op + len > size {
+                        return None;
+                    }
+                    let mut refp = op - po;
+                    for _ in 0..len {
+                        if alpha_only {
+                            out[op * 4 + 3] = out[refp * 4 + 3];
+                        } else {
+                            let (s, d) = (refp * 4, op * 4);
+                            out[d] = out[s];
+                            out[d + 1] = out[s + 1];
+                            out[d + 2] = out[s + 2];
+                            out[d + 3] = out[s + 3];
+                        }
+                        refp += 1;
+                        op += 1;
+                    }
+                } else {
+                    let src_id = image_id.checked_sub(image_dist as u64)?;
+                    let img = window.get(&src_id)?;
+                    let po = pixel_ofs as usize;
+                    if op + len > size || po + len > img.gross_pixels {
+                        return None;
+                    }
+                    for k in 0..len {
+                        let s = (po + k) * 4;
+                        let d = op * 4;
+                        if alpha_only {
+                            out[d + 3] = img.data[s + 3];
+                        } else {
+                            out[d] = img.data[s];
+                            out[d + 1] = img.data[s + 1];
+                            out[d + 2] = img.data[s + 2];
+                            out[d + 3] = img.data[s + 3];
+                        }
+                        op += 1;
+                    }
+                }
+            } else {
+                let count = (ctrl + 1) as usize;
+                if op + count > size {
+                    return None;
+                }
+                for _ in 0..count {
+                    let o = op * 4;
+                    if alpha_only {
+                        out[o + 3] = *body.get(ip)?;
+                        ip += 1;
+                    } else {
+                        out[o] = *body.get(ip)?;
+                        out[o + 1] = *body.get(ip + 1)?;
+                        out[o + 2] = *body.get(ip + 2)?;
+                        out[o + 3] = 0;
+                        ip += 3;
+                    }
+                    op += 1;
+                }
+            }
+
+            if op < size {
+                ctrl = *body.get(ip)? as u32;
+                ip += 1;
+            } else {
+                break;
+            }
+        }
+        Some(ip)
+    }
+
+impl DisplayChannel {
     /// Decode zlib compressed image
     fn decode_zlib(
         &self,
@@ -750,16 +1054,23 @@ impl DisplayChannel {
             "DisplayChannel: Starting event loop for channel {}",
             self.connection.channel_id
         );
-        eprintln!("DisplayChannel: Entering message read loop");
+        debug!("DisplayChannel: Entering message read loop");
         loop {
-            eprintln!("DisplayChannel: Waiting for message...");
             match self.connection.read_message().await {
                 Ok((header, data)) => {
-                    eprintln!("DisplayChannel: Got message!");
                     self.handle_message(&header, &data).await?;
+                    // SPICE ACK flow control: replenish the server's send window
+                    // every `ack_window` messages, else it stalls after one window.
+                    if self.ack_window > 0 {
+                        self.ack_count = self.ack_count.saturating_sub(1);
+                        if self.ack_count == 0 {
+                            self.ack_count = self.ack_window;
+                            self.connection.send_message(2, &[]).await?; // SPICE_MSGC_ACK
+                        }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("DisplayChannel: Error reading message: {e}");
+                    debug!("DisplayChannel: Error reading message: {e}");
                     return Err(e);
                 }
             }
@@ -992,24 +1303,11 @@ impl DisplayChannel {
 
 impl Channel for DisplayChannel {
     async fn handle_message(&mut self, header: &SpiceDataHeader, data: &[u8]) -> Result<()> {
-        eprintln!(
-            "DisplayChannel: Received message type {} with {} bytes",
+        debug!(
+            "DisplayChannel: msg type {} ({} bytes)",
             header.msg_type,
             data.len()
         );
-
-        // Log specific message types for debugging
-        match header.msg_type {
-            101 => eprintln!("  -> SPICE_MSG_DISPLAY_MODE"),
-            318 => eprintln!("  -> SPICE_MSG_DISPLAY_SURFACE_CREATE"),
-            319 => eprintln!("  -> SPICE_MSG_DISPLAY_SURFACE_DESTROY"),
-            122 => eprintln!("  -> SPICE_MSG_DISPLAY_STREAM_CREATE"),
-            123 => eprintln!("  -> SPICE_MSG_DISPLAY_STREAM_DATA"),
-            125 => eprintln!("  -> SPICE_MSG_DISPLAY_STREAM_DESTROY"),
-            302 => eprintln!("  -> SPICE_MSG_DISPLAY_DRAW_FILL"),
-            304 => eprintln!("  -> SPICE_MSG_DISPLAY_DRAW_COPY"),
-            _ => {}
-        }
 
         match header.msg_type {
             x if x == DisplayChannelMessage::Mode as u16 => {
@@ -1180,17 +1478,22 @@ impl Channel for DisplayChannel {
                 }
             }
             3 => {
-                // SPICE_MSG_SET_ACK
-                eprintln!("DisplayChannel: Received SET_ACK message");
-                // Parse the generation number
-                if data.len() >= 4 {
+                // SPICE_MSG_SET_ACK { generation: u32, window: u32 }
+                debug!("DisplayChannel: Received SET_ACK message");
+                if data.len() >= 8 {
                     let generation = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    eprintln!("DisplayChannel: SET_ACK generation: {generation}");
-
-                    // Send ACK_SYNC response
+                    let window = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                    // Arm periodic acking: send one SPICE_MSGC_ACK per `window`
+                    // messages received (see ack accounting in run()).
+                    self.ack_window = window;
+                    self.ack_count = window;
+                    debug!("DisplayChannel: SET_ACK generation={generation} window={window}");
                     let ack_data = generation.to_le_bytes();
                     self.connection.send_message(1, &ack_data).await?; // SPICE_MSGC_ACK_SYNC
-                    eprintln!("DisplayChannel: Sent ACK_SYNC response");
+                } else if data.len() >= 4 {
+                    let generation = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let ack_data = generation.to_le_bytes();
+                    self.connection.send_message(1, &ack_data).await?;
                 }
             }
             x if x == SPICE_MSG_DISPLAY_COPY_BITS => {
@@ -1370,6 +1673,57 @@ mod tests {
     use super::*;
     use binrw::BinWrite;
     use std::io::Cursor;
+
+    // GLZ control bytes below are hand-derived from spice-gtk decode-glz-tmpl.c
+    // (the authoritative reference), not from this crate's encoder — so the
+    // expectations test that our decoder matches the reference, not itself.
+
+    #[test]
+    fn glz_literal_then_same_image_run() {
+        // 4-pixel RGB32 image: 1 red literal, then a same-image back-ref of
+        // length 3 at offset 1 (repeat the previous pixel) -> 4 red pixels.
+        //  literal: ctrl=0x00 (count 1), B,G,R = 0,0,255
+        //  ref:     ctrl=0x60 (len=3,pixel_flag=0,ofs_lo=0), 0x00 (ofs_hi),
+        //           0x00 (image_flag=0,image_dist=0) -> ofs=1 (same-image bias)
+        let body = [0x00u8, 0x00, 0x00, 0xff, 0x60, 0x00, 0x00];
+        let mut out = vec![0u8; 4 * 4];
+        let window: HashMap<u64, GlzImage> = HashMap::new();
+        let used = glz_decode_body(&window, &body, &mut out, 4, 1, false)
+            .expect("glz decode failed");
+        assert_eq!(used, body.len());
+        // every pixel BGRX = (0,0,255,0)
+        for px in out.chunks_exact(4) {
+            assert_eq!(px, &[0, 0, 255, 0]);
+        }
+    }
+
+    #[test]
+    fn glz_cross_image_reference() {
+        // Window has image id=10 with 2 BGRX pixels; image id=11 references
+        // image_dist=1, pixel_ofs=0, len=2 -> copies both pixels from id=10.
+        //  ctrl=0x40 (len=2,pixel_flag=0,ofs_lo=0), 0x00 (ofs_hi),
+        //  0x01 (image_flag=0, image_dist=1)
+        let mut window: HashMap<u64, GlzImage> = HashMap::new();
+        window.insert(
+            10,
+            GlzImage { gross_pixels: 2, data: vec![10, 20, 30, 0, 40, 50, 60, 0] },
+        );
+        let body = [0x40u8, 0x00, 0x01];
+        let mut out = vec![0u8; 2 * 4];
+        let used = glz_decode_body(&window, &body, &mut out, 2, 11, false)
+            .expect("glz cross-image decode failed");
+        assert_eq!(used, body.len());
+        assert_eq!(out, vec![10, 20, 30, 0, 40, 50, 60, 0]);
+    }
+
+    #[test]
+    fn glz_truncated_returns_none() {
+        // A reference header that runs past the end must return None, not panic.
+        let body = [0x60u8, 0x00]; // missing the 3rd ref byte
+        let mut out = vec![0u8; 4 * 4];
+        let window: HashMap<u64, GlzImage> = HashMap::new();
+        assert!(glz_decode_body(&window, &body, &mut out, 4, 1, false).is_none());
+    }
 
     #[test]
     fn test_copy_bits_message_parsing() {

@@ -51,8 +51,37 @@ structs that ARE read live (`SpiceMsgSurfaceCreate/Destroy`, `SpiceMonitorsConfi
 `SpiceMsgDisplayMark`, `SpiceCopyBits`) are validated when their phases land
 (F = COPY_BITS, H = surfaces).
 
+- **GLZ_RGB decoder** (`decode_glz` + free `glz_decode_body`, `display.rs`): port
+  of spice-gtk `decode-glz.c` / `decode-glz-tmpl.c`. GLZ is LZSS over a global
+  dictionary window of previously-decoded images. 33-byte big-endian header
+  (`[type|top_down]` packed byte, `id u64`, `win_head_dist u32`); references with
+  `image_dist == 0` are same-image, else resolve against `glz_window[id-dist]`
+  (kept on `DisplayChannel`, released past `win_head_dist`). RGB24/RGB32 + RGBA
+  alpha pass; RGB16/PLT deferred. Unit-tested against hand-derived-from-reference
+  control vectors (`glz_literal_then_same_image_run`, `glz_cross_image_reference`,
+  `glz_truncated_returns_none`). **NOT yet validated against real QEMU GLZ
+  traffic** — see the streaming-gap note below.
+- **SPICE ACK flow control** (`display.rs`): the channel sent only `ACK_SYNC` on
+  `SET_ACK`, never the periodic `MSGC_ACK`. Now parses the `window` and acks every
+  `window` messages (necessary, though not sufficient — see below).
+- **`SpiceRect` test** (`protocol/tests.rs`): updated to assert the corrected
+  `{top,left,bottom,right}` wire order.
+
+## KNOWN BLOCKER: no incremental display updates (streaming gap)
+Empirically, this client receives only the **initial paint** (SET_ACK, INVAL,
+SURFACE_CREATE, one DRAW_COPY, MARK) and then **no further display messages** —
+confirmed across an off/lz/auto_glz QEMU and a live Windows desktop, with the
+client socket `Recv-Q` staying 0 (the server is not sending more). So the gap is
+client-side: something a real client (spice-gtk) sends to keep the server
+streaming is missing. ACK windowing and per-message ACK were both tried and did
+NOT unblock it. This blocks live validation of GLZ/QUIC/cache (they only exercise
+on incremental updates) AND would make the on-device client show only the first
+frame. Needs diffing against real spice-gtk wire traffic to find the missing
+client message(s). The crate's "transport works" only ever covered frame 1.
+
 ## TODO (in progress)
-- GLZ_RGB (102, QEMU `auto_glz` default) / ZLIB_GLZ_RGB (107) / QUIC (1) / LZ4 (109) image decoders.
+- **Resolve the streaming gap above (highest priority — gates everything).**
+- ZLIB_GLZ_RGB (107) / QUIC (1) / LZ4 (109) image decoders.
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
 - Cursor channel shapes; multi-surface; remaining draw ops (FILL/OPAQUE/COPY_BITS).
 

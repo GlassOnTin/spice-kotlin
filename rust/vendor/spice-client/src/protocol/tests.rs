@@ -321,20 +321,17 @@ fn test_spice_rect_serialization() {
     let bytes = cursor.into_inner();
     assert_eq!(bytes.len(), 16); // 4 i32 values
 
-    // Verify field order in serialized data
+    // SPICE wire order is {top, left, bottom, right} (HAVEN fix, verified
+    // against QEMU — see HAVEN_PATCHES.md), not {left, top, right, bottom}.
     let left_bytes = (-100i32).to_le_bytes();
     let top_bytes = (-50i32).to_le_bytes();
     let right_bytes = (1024i32).to_le_bytes();
     let bottom_bytes = (768i32).to_le_bytes();
 
-    assert_eq!(&bytes[0..4], &left_bytes, "left field should be first");
-    assert_eq!(&bytes[4..8], &top_bytes, "top field should be second");
-    assert_eq!(&bytes[8..12], &right_bytes, "right field should be third");
-    assert_eq!(
-        &bytes[12..16],
-        &bottom_bytes,
-        "bottom field should be fourth"
-    );
+    assert_eq!(&bytes[0..4], &top_bytes, "top field should be first");
+    assert_eq!(&bytes[4..8], &left_bytes, "left field should be second");
+    assert_eq!(&bytes[8..12], &bottom_bytes, "bottom field should be third");
+    assert_eq!(&bytes[12..16], &right_bytes, "right field should be fourth");
 
     // Read back
     let mut cursor = Cursor::new(&bytes);

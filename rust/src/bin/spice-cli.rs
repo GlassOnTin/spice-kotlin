@@ -45,21 +45,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let frames = Arc::new(AtomicU64::new(0));
     let frames_cb = frames.clone();
+    // Save the LATEST frame each update so post-activity (e.g. GLZ incremental)
+    // content is captured, not just the initial full paint.
     client
         .set_display_update_callback(0, move |surface: &DisplaySurface| {
             let n = frames_cb.fetch_add(1, Ordering::Relaxed) + 1;
             report_surface(n, surface);
-            if n == 1 {
-                save_ppm("/tmp/spice-frame.ppm", surface);
-            }
+            save_ppm("/tmp/spice-frame.ppm", surface);
         })
         .await
         .map_err(|e| format!("set_display_update_callback: {e}"))?;
 
     client.start_event_loop().await.map_err(|e| format!("start_event_loop: {e}"))?;
-    println!("spice-cli: event loop started; observing for 10s");
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    let observe_secs: u64 = std::env::var("SPICE_OBSERVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    println!("spice-cli: event loop started; observing for {observe_secs}s");
+
+    // Optionally wiggle the mouse to provoke incremental repaints (GLZ uses the
+    // global dictionary across updates, so it only appears once the screen
+    // changes within a live connection). SPICE_WIGGLE=1 to enable.
+    if std::env::var_os("SPICE_WIGGLE").is_some() {
+        let mover = client.clone();
+        tokio::spawn(async move {
+            let pts = [
+                (500, 300),
+                (520, 350),
+                (540, 400),
+                (560, 450),
+                (560, 500),
+                (540, 256),
+                (520, 304),
+                (500, 352),
+            ];
+            let mut first = true;
+            for _ in 0..200 {
+                for (x, y) in pts {
+                    let r = mover.send_mouse_motion(0, x, y).await;
+                    if first {
+                        first = false;
+                        println!("spice-cli: first mouse_motion result: {r:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            }
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(observe_secs)).await;
 
     let total = frames.load(Ordering::Relaxed);
     println!("spice-cli: observed {total} display update(s)");
