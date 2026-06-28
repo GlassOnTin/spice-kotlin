@@ -16,7 +16,16 @@ use spice_client::{DisplaySurface, SpiceClientShared};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // The spice-client decoder emits diagnostics via `tracing`, not `log`;
+    // install a subscriber so warn!/debug! actually print. RUST_LOG controls it.
+    // (tracing-subscriber also bridges the `log` crate, so env_logger is unneeded.)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
     let mut args = std::env::args().skip(1);
     let host = args.next().unwrap_or_else(|| "127.0.0.1".to_string());

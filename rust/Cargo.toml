@@ -29,10 +29,17 @@ required-features = ["host-cli"]
 
 [features]
 default = []
-host-cli = ["env_logger"]
+host-cli = ["env_logger", "tracing-subscriber"]
 
 [dependencies.env_logger]
 version = "0.11"
+optional = true
+
+# The vendored spice-client logs via `tracing`; install a subscriber in the
+# host CLI so decoder warn!/debug! diagnostics are actually visible.
+[dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter"]
 optional = true
 
 [build-dependencies]

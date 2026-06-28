@@ -456,6 +456,26 @@ impl DisplayChannel {
         ]);
         match img_type {
             SPICE_IMAGE_TYPE_BITMAP => self.decode_bitmap_inline(data, offset + 18, width, height),
+            SPICE_IMAGE_TYPE_LZ_RGB => {
+                // BinaryData wrapper: data_size u32 LE @desc+18, LZ stream @desc+22.
+                let ds_off = offset + 18;
+                if ds_off + 4 > data.len() {
+                    warn!("LZ_RGB data_size out of bounds");
+                    return Ok(None);
+                }
+                let data_size = u32::from_le_bytes([
+                    data[ds_off],
+                    data[ds_off + 1],
+                    data[ds_off + 2],
+                    data[ds_off + 3],
+                ]) as usize;
+                let s = offset + 22;
+                if s > data.len() {
+                    return Ok(None);
+                }
+                let e = (s + data_size).min(data.len());
+                self.decode_lz(&data[s..e])
+            }
             other => {
                 warn!(
                     "HAVEN: image type {} ({}x{}) not yet supported",
@@ -622,17 +642,86 @@ impl DisplayChannel {
 
     /// Decode LZ compressed image (SPICE custom LZ format)
     /// This is a simplified implementation - full LZ support would require implementing the SPICE LZ algorithm
-    fn decode_lz(
-        &self,
-        _compressed_data: &[u8],
-        _width: u32,
-        _height: u32,
-    ) -> Result<Option<(Vec<u8>, u32, u32)>> {
-        // TODO: Implement SPICE LZ decompression algorithm (Phase B).
-        // Until then return None — the caller leaves the surface untouched
-        // rather than inventing pixels.
-        warn!("LZ decompression not yet implemented");
-        Ok(None)
+    /// Decode a SPICE LZ_RGB image stream (begins at the "LZ  " magic).
+    /// Port of spice-common lz.c (header big-endian; LZSS body per
+    /// lz_decompress_tmpl.c). Returns top-down RGBA. Verified against QEMU
+    /// `image-compression=lz` (Ubuntu installer frame). RGB16 / PLT deferred.
+    fn decode_lz(&self, stream: &[u8]) -> Result<Option<(Vec<u8>, u32, u32)>> {
+        if stream.len() < 28 {
+            warn!("LZ stream too short ({} bytes)", stream.len());
+            return Ok(None);
+        }
+        let be = |o: usize| {
+            u32::from_be_bytes([stream[o], stream[o + 1], stream[o + 2], stream[o + 3]])
+        };
+        let magic = be(0);
+        if magic != 0x2020_5a4c {
+            warn!("LZ bad magic {magic:#010x}");
+            return Ok(None);
+        }
+        let lz_type = be(8);
+        let width = be(12);
+        let height = be(16);
+        let top_down = be(24) != 0;
+        let n_pixels = width as usize * height as usize;
+        if n_pixels == 0 || n_pixels > 64 * 1024 * 1024 {
+            warn!("LZ implausible size {width}x{height}");
+            return Ok(None);
+        }
+        let body = &stream[28..];
+
+        // LZ image sub-types (lz_common.h): RGB16=6, RGB24=7, RGB32=8, RGBA=9.
+        // RGB24/RGB32 read 3 stream bytes/pixel (b,g,r); RGBA adds an alpha pass.
+        let rgba_alpha = match lz_type {
+            7 | 8 => false,
+            9 => true,
+            6 => {
+                warn!("LZ RGB16 sub-type not yet implemented");
+                return Ok(None);
+            }
+            other => {
+                warn!("LZ image sub-type {other} not supported");
+                return Ok(None);
+            }
+        };
+
+        // Decompress the RGB pass into a BGRX (4 bytes/pixel) buffer.
+        let mut bgrx = vec![0u8; n_pixels * 4];
+        let consumed = match lz_decompress(body, &mut bgrx, n_pixels, false) {
+            Some(c) => c,
+            None => {
+                warn!("LZ rgb decompress failed/truncated");
+                return Ok(None);
+            }
+        };
+        if rgba_alpha {
+            // Second LZSS stream carries the alpha (pad) byte per pixel.
+            if lz_decompress(&body[consumed..], &mut bgrx, n_pixels, true).is_none() {
+                warn!("LZ alpha decompress failed");
+                return Ok(None);
+            }
+        } else {
+            for px in bgrx.chunks_exact_mut(4) {
+                px[3] = 255; // opaque
+            }
+        }
+
+        // BGRX -> top-down RGBA (matches decode_bitmap_inline output).
+        let w = width as usize;
+        let h = height as usize;
+        let mut rgba = vec![0u8; n_pixels * 4];
+        for y in 0..h {
+            let sy = if top_down { y } else { h - 1 - y };
+            for x in 0..w {
+                let s = (sy * w + x) * 4;
+                let d = (y * w + x) * 4;
+                rgba[d] = bgrx[s + 2];
+                rgba[d + 1] = bgrx[s + 1];
+                rgba[d + 2] = bgrx[s];
+                rgba[d + 3] = bgrx[s + 3];
+            }
+        }
+        Ok(Some((rgba, width, height)))
     }
 
     /// Decode zlib compressed image
@@ -1910,4 +1999,94 @@ mod tests {
         assert_eq!(parsed.fore_brush.color, 0x000000);
         assert_eq!(parsed.back_brush.color, 0xFFFFFF);
     }
+}
+
+/// SPICE LZSS inner decompressor (port of lz_decompress_tmpl.c).
+///
+/// `out` holds 4-byte BGRX pixels (`n_pixels` of them). Two modes:
+/// - RGB pass (`alpha_only == false`): each literal reads 3 stream bytes
+///   (b,g,r), pad set to 0; references copy whole pixels. Covers RGB24/RGB32
+///   and the colour pass of RGBA. Length bias +1.
+/// - Alpha pass (`alpha_only == true`, RGBA only): each literal reads 1 byte
+///   into the pad/alpha lane; references copy only that lane. Length bias +3.
+///
+/// Returns the number of `body` bytes consumed, or `None` on truncation /
+/// an out-of-range back-reference (caller then leaves the surface untouched).
+fn lz_decompress(body: &[u8], out: &mut [u8], n_pixels: usize, alpha_only: bool) -> Option<usize> {
+    const MAX_COPY: u32 = 32;
+    const MAX_DISTANCE: u32 = 8191;
+    let len_bias: u32 = if alpha_only { 3 } else { 1 };
+    let mut ip = 0usize;
+    let mut op = 0usize; // pixel index
+
+    while op < n_pixels {
+        let ctrl = *body.get(ip)? as u32;
+        ip += 1;
+        if ctrl >= MAX_COPY {
+            // back-reference / run
+            let mut len = (ctrl >> 5) - 1;
+            let mut ofs = (ctrl & 31) << 8;
+            if len == 6 {
+                loop {
+                    let code = *body.get(ip)? as u32;
+                    ip += 1;
+                    len += code;
+                    if code != 255 {
+                        break;
+                    }
+                }
+            }
+            let code = *body.get(ip)? as u32;
+            ip += 1;
+            ofs += code;
+            if code == 255 && (ofs - code) == (31 << 8) {
+                ofs = (*body.get(ip)? as u32) << 8;
+                ip += 1;
+                ofs += *body.get(ip)? as u32;
+                ip += 1;
+                ofs += MAX_DISTANCE;
+            }
+            let len = (len + len_bias) as usize;
+            let ofs = (ofs + 1) as usize;
+            if ofs > op || op + len > n_pixels {
+                return None; // ref underflow / output overflow
+            }
+            let mut refp = op - ofs;
+            // Element-wise so the run case (ofs == 1) propagates correctly.
+            for _ in 0..len {
+                if alpha_only {
+                    out[op * 4 + 3] = out[refp * 4 + 3];
+                } else {
+                    let (s, d) = (refp * 4, op * 4);
+                    out[d] = out[s];
+                    out[d + 1] = out[s + 1];
+                    out[d + 2] = out[s + 2];
+                    out[d + 3] = out[s + 3];
+                }
+                refp += 1;
+                op += 1;
+            }
+        } else {
+            // literal run, count biased by 1
+            let count = (ctrl + 1) as usize;
+            if op + count > n_pixels {
+                return None;
+            }
+            for _ in 0..count {
+                let o = op * 4;
+                if alpha_only {
+                    out[o + 3] = *body.get(ip)?;
+                    ip += 1;
+                } else {
+                    out[o] = *body.get(ip)?;
+                    out[o + 1] = *body.get(ip + 1)?;
+                    out[o + 2] = *body.get(ip + 2)?;
+                    out[o + 3] = 0;
+                    ip += 3;
+                }
+                op += 1;
+            }
+        }
+    }
+    Some(ip)
 }

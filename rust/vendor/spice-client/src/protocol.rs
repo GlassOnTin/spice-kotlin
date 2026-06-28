@@ -809,18 +809,21 @@ pub struct SpiceImageDescriptor {
     pub height: u32,
 }
 
-// Image types
+// Image types — values per spice-protocol spice/enums.h (authoritative).
+// HAVEN: upstream 0.2.0 had these shifted by one from 100 up (LZ=100,GLZ=101,...),
+// which mis-dispatched every compressed image. Corrected to the canonical enum.
 pub const SPICE_IMAGE_TYPE_BITMAP: u8 = 0;
 pub const SPICE_IMAGE_TYPE_QUIC: u8 = 1;
-pub const SPICE_IMAGE_TYPE_LZ: u8 = 100;
-pub const SPICE_IMAGE_TYPE_GLZ: u8 = 101;
-pub const SPICE_IMAGE_TYPE_FROM_CACHE: u8 = 102;
-pub const SPICE_IMAGE_TYPE_SURFACE: u8 = 103;
-pub const SPICE_IMAGE_TYPE_JPEG: u8 = 104;
-pub const SPICE_IMAGE_TYPE_FROM_CACHE_LOSSLESS: u8 = 105;
-pub const SPICE_IMAGE_TYPE_ZLIB_GLZ_RGB: u8 = 106;
-pub const SPICE_IMAGE_TYPE_JPEG_ALPHA: u8 = 107;
-pub const SPICE_IMAGE_TYPE_LZ4: u8 = 108;
+pub const SPICE_IMAGE_TYPE_LZ_PLT: u8 = 100;
+pub const SPICE_IMAGE_TYPE_LZ_RGB: u8 = 101;
+pub const SPICE_IMAGE_TYPE_GLZ_RGB: u8 = 102;
+pub const SPICE_IMAGE_TYPE_FROM_CACHE: u8 = 103;
+pub const SPICE_IMAGE_TYPE_SURFACE: u8 = 104;
+pub const SPICE_IMAGE_TYPE_JPEG: u8 = 105;
+pub const SPICE_IMAGE_TYPE_FROM_CACHE_LOSSLESS: u8 = 106;
+pub const SPICE_IMAGE_TYPE_ZLIB_GLZ_RGB: u8 = 107;
+pub const SPICE_IMAGE_TYPE_JPEG_ALPHA: u8 = 108;
+pub const SPICE_IMAGE_TYPE_LZ4: u8 = 109;
 
 // Bitmap format
 pub const SPICE_BITMAP_FMT_1BIT_LE: u8 = 1;

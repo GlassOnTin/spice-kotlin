@@ -1553,6 +1553,7 @@ dependencies = [
  "log",
  "spice-client",
  "tokio",
+ "tracing-subscriber",
  "uniffi",
 ]
 
