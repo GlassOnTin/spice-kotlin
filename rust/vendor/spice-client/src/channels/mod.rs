@@ -3,6 +3,7 @@ pub mod cursor;
 pub mod display;
 pub mod inputs;
 pub mod main;
+pub mod quic;
 
 #[cfg(target_arch = "wasm32")]
 pub mod display_wasm;

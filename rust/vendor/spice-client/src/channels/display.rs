@@ -584,6 +584,28 @@ impl DisplayChannel {
                     }
                 }
             }
+            SPICE_IMAGE_TYPE_QUIC => {
+                // SpiceQUICData: data_size u32 LE @desc+18, QUIC stream @desc+22.
+                let ds_off = offset + 18;
+                if ds_off + 4 > data.len() {
+                    warn!("QUIC data_size out of bounds");
+                    None
+                } else {
+                    let data_size = u32::from_le_bytes([
+                        data[ds_off],
+                        data[ds_off + 1],
+                        data[ds_off + 2],
+                        data[ds_off + 3],
+                    ]) as usize;
+                    let s = offset + 22;
+                    if s > data.len() {
+                        None
+                    } else {
+                        let e = (s + data_size).min(data.len());
+                        crate::channels::quic::quic_decode(&data[s..e])
+                    }
+                }
+            }
             SPICE_IMAGE_TYPE_FROM_CACHE | SPICE_IMAGE_TYPE_FROM_CACHE_LOSSLESS => {
                 // The body is empty; descriptor.id is the pixmap-cache key.
                 match self.image_cache.get(id) {

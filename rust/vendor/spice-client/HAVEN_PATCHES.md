@@ -80,6 +80,25 @@ servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl 
     **zero** times and never sent FROM_CACHE. Real FROM_CACHE needs a 2D-accel QXL guest
     (Win7/XPDM or old Linux xf86-video-qxl). The decode path is correct by construction
     but should be re-checked against such a guest if one becomes available.
+- **QUIC decoder** (`src/channels/quic.rs`, new module; dispatched from
+  `decode_image_at`): port of spice-common `common/quic.c` + `quic_tmpl.c` +
+  `quic_family_tmpl.c`. QUIC is SFALIC/LOCO-I — a spatial predictor (left `a`, above
+  `b`, `(a+b)/2`) with adaptive Golomb-Rice coding through a 32-bit MSB bit reader,
+  per-channel context buckets selected by the correlate value, a `tabrand`-driven
+  wait-mask model-update schedule, and MELCODE run lengths for solid runs. Wire body
+  after the descriptor is `SpiceQUICData{data_size u32}` + the QUIC stream (header:
+  magic `"QUIC"`, version 0, image-type, width, height — all as 32-bit MSB words).
+  Implemented for **RGB24 (3) / RGB32 (4) / RGBA (5)**, all 8bpc: RGB is 3 interleaved
+  channels on one wait-mask state; RGBA adds a 4th (alpha) channel decoded as a
+  separate per-row pass with its own state. Output is opaque RGBA (the alpha plane is
+  decoded to consume the bitstream but forced to 255, matching the BGRx primary-surface
+  path). **GRAY (1) and RGB16 (2)** are not implemented (need the single-plane / 5bpc
+  family) — they `warn!` and leave the surface untouched.
+  - Verified: an `image-compression=quic`-forced Windows Server 2025 streams **only**
+    QUIC type-1 images (the QXL framebuffer is sent as `QUIC_IMAGE_TYPE_RGBA`); 129
+    images decoded across 131 display updates with **0 warnings / 0 bad-magic / 0
+    panics**, and the captured frame (LogonUI window chrome, colored prompt text,
+    password dots, cursor) is pixel-correct.
 
 ## Design note: binrw structs vs. manual parse
 The image/draw wire structs in `protocol.rs` (`SpiceImage`, `SpiceImageDescriptor`,
@@ -141,7 +160,9 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 0 decode warnings, frame pixel-correct).
 
 ## TODO (in progress)
-- QUIC (1) / LZ4 (109) image decoders.
+- LZ4 (109) image decoder.
+- QUIC GRAY (1) / RGB16 (2) sub-types (only RGB24/RGB32/RGBA decoded so far — the 5bpc
+  family / single-plane paths are unported; a real server would have to force them).
 - FROM_CACHE (103) real-traffic check against a 2D-accel QXL guest (decode implemented;
   modern Windows QXL is display-only so no cache hints — see the FROM_CACHE entry above).
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
