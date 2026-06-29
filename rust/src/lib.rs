@@ -295,19 +295,36 @@ fn map_err(e: &spice_client::SpiceError) -> SpiceError {
     }
 }
 
-/// Convert a SPICE display surface (RGBA32) into a [FrameData]. The primary
-/// surface's `data` is laid out RGBA, 4 bytes/pixel, which Android's
-/// ARGB_8888 `Bitmap.copyPixelsFromBuffer` consumes directly.
+/// Swap R↔B in a 4-byte-per-pixel buffer, RGBA → BGRA.
+///
+/// The decoder builds surfaces and cursors as RGBA (R first). Android's
+/// `ARGB_8888 Bitmap.copyPixelsFromBuffer` reads each pixel as the little-endian
+/// `0xAARRGGBB` int — i.e. bytes **B, G, R, A** — so it expects BGRA, the same
+/// order IronRDP feeds for RDP. Handing it RGBA renders red and blue swapped
+/// (#286). We swap once here at the FFI boundary so the on-device Bitmap is
+/// correct; host tools (`spice-cli`) read the RGBA `DisplaySurface` directly and
+/// are unaffected.
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    out
+}
+
+/// Convert a SPICE display surface into a [FrameData] for the Android Bitmap.
+/// The surface `data` is RGBA; we emit BGRA — see [rgba_to_bgra].
 fn surface_to_frame(surface: &DisplaySurface) -> FrameData {
     FrameData {
         width: surface.width as u16,
         height: surface.height as u16,
-        pixels: surface.data.clone(),
+        pixels: rgba_to_bgra(&surface.data),
     }
 }
 
 /// Convert a decoded SPICE cursor shape + position/visibility into [CursorData].
-/// `shape.data` is already RGBA (alpha composited by the cursor channel).
+/// `shape.data` is RGBA (alpha composited by the cursor channel); emit BGRA to
+/// match the framebuffer's byte order — see [rgba_to_bgra].
 fn cursor_to_data(shape: &CursorShape, pos: (i32, i32), visible: bool) -> CursorData {
     CursorData {
         width: shape.width,
@@ -317,6 +334,6 @@ fn cursor_to_data(shape: &CursorShape, pos: (i32, i32), visible: bool) -> Cursor
         x: pos.0,
         y: pos.1,
         visible,
-        pixels: shape.data.clone(),
+        pixels: rgba_to_bgra(&shape.data),
     }
 }

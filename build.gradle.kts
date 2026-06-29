@@ -46,6 +46,9 @@ val buildSpiceNative by tasks.registering(Exec::class) {
     val jniDir = file("jniLibs")
 
     inputs.dir(rustDir.resolve("src"))
+    // The decoder lives in the vendored crate; without this a decoder change
+    // leaves the task UP-TO-DATE and ships a stale .so (#286).
+    inputs.dir(rustDir.resolve("vendor"))
     inputs.file(rustDir.resolve("Cargo.toml"))
     inputs.file(rustDir.resolve("Cargo.lock"))
     outputs.dir(jniDir)
