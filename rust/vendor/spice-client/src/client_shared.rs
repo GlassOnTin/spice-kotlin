@@ -1,6 +1,6 @@
 use crate::channels::cursor::{CursorChannel, CursorShape};
 use crate::channels::display::DisplayChannel;
-use crate::channels::inputs::InputsChannel;
+use crate::channels::inputs::{encode_key, encode_mouse_button, encode_mouse_position, InputsChannel};
 use crate::channels::main::MainChannel;
 use crate::channels::MouseButton;
 use crate::error::{Result, SpiceError};
@@ -10,6 +10,7 @@ use crate::video::{create_video_output, VideoOutput};
 use instant::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 #[cfg(target_arch = "wasm32")]
 use tracing::warn;
@@ -37,6 +38,9 @@ pub struct SpiceClientInner {
     main_channel: Option<Arc<Mutex<MainChannel>>>,
     display_channels: HashMap<u8, Arc<Mutex<DisplayChannel>>>,
     inputs_channels: HashMap<u8, Arc<Mutex<InputsChannel>>>,
+    /// Per-channel queue handles for outgoing input, decoupled from the run-loop
+    /// lock so sends never deadlock against `InputsChannel::run`.
+    inputs_senders: HashMap<u8, mpsc::UnboundedSender<(u16, Vec<u8>)>>,
     cursor_channels: HashMap<u8, Arc<Mutex<CursorChannel>>>,
     #[cfg(not(target_arch = "wasm32"))]
     channel_tasks: Vec<JoinHandle<Result<()>>>,
@@ -106,6 +110,7 @@ impl SpiceClientShared {
                 main_channel: None,
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
+                inputs_senders: HashMap::new(),
                 cursor_channels: HashMap::new(),
                 channel_tasks: Vec::new(),
                 video_output: create_video_output(),
@@ -190,6 +195,7 @@ impl SpiceClientShared {
                 main_channel: None,
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
+                inputs_senders: HashMap::new(),
                 cursor_channels: HashMap::new(),
                 channel_tasks: Vec::new(),
                 video_output: create_video_output(),
@@ -492,6 +498,9 @@ impl SpiceClientShared {
                             session_id,
                         )
                         .await?;
+                        inner
+                            .inputs_senders
+                            .insert(channel_id, inputs_channel.outgoing_sender());
                         inner
                             .inputs_channels
                             .insert(channel_id, Arc::new(Mutex::new(inputs_channel)));
@@ -898,53 +907,27 @@ impl SpiceClientShared {
         inner.main_channel = None;
         inner.display_channels.clear();
         inner.inputs_channels.clear();
+        inner.inputs_senders.clear();
     }
 
     // Input forwarding methods
 
     /// Sends a key down event to the specified inputs channel.
     pub async fn send_key_down(&self, channel_id: u8, scancode: u32) -> Result<()> {
-        let inner = self.inner.lock().await;
-
-        if let Some(inputs_channel_arc) = inner.inputs_channels.get(&channel_id) {
-            let mut inputs_channel = inputs_channel_arc.lock().await;
-            inputs_channel.send_key_down(scancode).await
-        } else {
-            Err(SpiceError::Protocol(format!(
-                "Inputs channel {} not connected",
-                channel_id
-            )))
-        }
+        self.enqueue_input(channel_id, encode_key(scancode, true))
+            .await
     }
 
     /// Sends a key up event to the specified inputs channel.
     pub async fn send_key_up(&self, channel_id: u8, scancode: u32) -> Result<()> {
-        let inner = self.inner.lock().await;
-
-        if let Some(inputs_channel_arc) = inner.inputs_channels.get(&channel_id) {
-            let mut inputs_channel = inputs_channel_arc.lock().await;
-            inputs_channel.send_key_up(scancode).await
-        } else {
-            Err(SpiceError::Protocol(format!(
-                "Inputs channel {} not connected",
-                channel_id
-            )))
-        }
+        self.enqueue_input(channel_id, encode_key(scancode, false))
+            .await
     }
 
-    /// Sends a mouse motion event to the specified inputs channel.
+    /// Sends an absolute pointer position to the specified inputs channel.
     pub async fn send_mouse_motion(&self, channel_id: u8, x: i32, y: i32) -> Result<()> {
-        let inner = self.inner.lock().await;
-
-        if let Some(inputs_channel_arc) = inner.inputs_channels.get(&channel_id) {
-            let mut inputs_channel = inputs_channel_arc.lock().await;
-            inputs_channel.send_mouse_motion(x, y).await
-        } else {
-            Err(SpiceError::Protocol(format!(
-                "Inputs channel {} not connected",
-                channel_id
-            )))
-        }
+        self.enqueue_input(channel_id, encode_mouse_position(x, y, 0))
+            .await
     }
 
     /// Sends a mouse button event to the specified inputs channel.
@@ -954,53 +937,41 @@ impl SpiceClientShared {
         button: MouseButton,
         pressed: bool,
     ) -> Result<()> {
-        let inner = self.inner.lock().await;
-
-        if let Some(inputs_channel_arc) = inner.inputs_channels.get(&channel_id) {
-            let mut inputs_channel = inputs_channel_arc.lock().await;
-            inputs_channel.send_mouse_button(button, pressed).await
-        } else {
-            Err(SpiceError::Protocol(format!(
-                "Inputs channel {} not connected",
-                channel_id
-            )))
-        }
+        self.enqueue_input(channel_id, encode_mouse_button(button, pressed))
+            .await
     }
 
-    /// Sends a mouse wheel event to the specified inputs channel.
+    /// Sends a mouse wheel event (mapped to wheel-button press+release).
     pub async fn send_mouse_wheel(
         &self,
         channel_id: u8,
         _delta_x: i32,
         delta_y: i32,
     ) -> Result<()> {
-        let inner = self.inner.lock().await;
-
-        if let Some(inputs_channel_arc) = inner.inputs_channels.get(&channel_id) {
-            let mut inputs_channel = inputs_channel_arc.lock().await;
-            // Convert wheel deltas to button presses (SPICE protocol uses button events for wheel)
-            if delta_y > 0 {
-                inputs_channel
-                    .send_mouse_button(MouseButton::WheelUp, true)
-                    .await?;
-                inputs_channel
-                    .send_mouse_button(MouseButton::WheelUp, false)
-                    .await
-            } else if delta_y < 0 {
-                inputs_channel
-                    .send_mouse_button(MouseButton::WheelDown, true)
-                    .await?;
-                inputs_channel
-                    .send_mouse_button(MouseButton::WheelDown, false)
-                    .await
-            } else {
-                Ok(())
-            }
+        let button = if delta_y > 0 {
+            MouseButton::WheelUp
+        } else if delta_y < 0 {
+            MouseButton::WheelDown
         } else {
-            Err(SpiceError::Protocol(format!(
-                "Inputs channel {} not connected",
-                channel_id
-            )))
+            return Ok(());
+        };
+        self.enqueue_input(channel_id, encode_mouse_button(button, true))
+            .await?;
+        self.enqueue_input(channel_id, encode_mouse_button(button, false))
+            .await
+    }
+
+    /// Queues an outgoing input message on the channel's run-loop drain, without
+    /// taking the run-held channel lock (which would deadlock).
+    async fn enqueue_input(&self, channel_id: u8, msg: (u16, Vec<u8>)) -> Result<()> {
+        let inner = self.inner.lock().await;
+        match inner.inputs_senders.get(&channel_id) {
+            Some(tx) => tx.send(msg).map_err(|_| {
+                SpiceError::Protocol(format!("Inputs channel {channel_id} closed"))
+            }),
+            None => Err(SpiceError::Protocol(format!(
+                "Inputs channel {channel_id} not connected"
+            ))),
         }
     }
 

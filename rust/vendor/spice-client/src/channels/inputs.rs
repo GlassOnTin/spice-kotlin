@@ -3,6 +3,7 @@
 use crate::channels::{Channel, ChannelConnection, InputEvent, KeyCode, MouseButton};
 use crate::error::{Result, SpiceError};
 use crate::protocol::*;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Mouse operation mode
@@ -17,6 +18,11 @@ pub struct InputsChannel {
     pub(crate) connection: ChannelConnection,
     mouse_mode: MouseMode,
     modifiers: KeyModifiers,
+    /// Outgoing input messages are queued here and drained by `run()` — the sole
+    /// reader/writer of the socket — so external senders never contend the
+    /// run-loop's channel lock (which previously deadlocked every input).
+    outgoing_tx: mpsc::UnboundedSender<(u16, Vec<u8>)>,
+    outgoing_rx: Option<mpsc::UnboundedReceiver<(u16, Vec<u8>)>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -45,11 +51,7 @@ impl InputsChannel {
         }
         connection.handshake().await?;
 
-        Ok(Self {
-            connection,
-            mouse_mode: MouseMode::Server,
-            modifiers: KeyModifiers::default(),
-        })
+        Ok(Self::build(connection))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -72,11 +74,7 @@ impl InputsChannel {
         .await?;
         connection.handshake().await?;
 
-        Ok(Self {
-            connection,
-            mouse_mode: MouseMode::Server,
-            modifiers: KeyModifiers::default(),
-        })
+        Ok(Self::build(connection))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -102,11 +100,32 @@ impl InputsChannel {
         }
         connection.handshake().await?;
 
-        Ok(Self {
+        Ok(Self::build(connection))
+    }
+
+    /// Builds an inputs channel around an established connection, wiring the
+    /// outgoing queue that `run()` drains.
+    fn build(connection: ChannelConnection) -> Self {
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        Self {
             connection,
             mouse_mode: MouseMode::Server,
             modifiers: KeyModifiers::default(),
-        })
+            outgoing_tx,
+            outgoing_rx: Some(outgoing_rx),
+        }
+    }
+
+    /// Clonable handle to enqueue outgoing input messages without touching the
+    /// run-loop's channel lock.
+    pub(crate) fn outgoing_sender(&self) -> mpsc::UnboundedSender<(u16, Vec<u8>)> {
+        self.outgoing_tx.clone()
+    }
+
+    fn enqueue(&self, msg: (u16, Vec<u8>)) -> Result<()> {
+        self.outgoing_tx
+            .send(msg)
+            .map_err(|_| SpiceError::Protocol("inputs channel closed".into()))
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
@@ -143,70 +162,24 @@ impl InputsChannel {
         Ok(())
     }
 
-    /// Sends a key down event with scancode
+    /// Queues a key-down event (scancode); the run loop sends it.
     pub async fn send_key_down(&mut self, scancode: u32) -> Result<()> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&scancode.to_le_bytes());
-
-        self.connection
-            .send_message(SPICE_MSG_INPUTS_KEY_DOWN, &data)
-            .await?;
-        debug!("Sent key down: scancode {}", scancode);
-        Ok(())
+        self.enqueue(encode_key(scancode, true))
     }
 
-    /// Sends a key up event with scancode
+    /// Queues a key-up event (scancode).
     pub async fn send_key_up(&mut self, scancode: u32) -> Result<()> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&scancode.to_le_bytes());
-
-        self.connection
-            .send_message(SPICE_MSG_INPUTS_KEY_UP, &data)
-            .await?;
-        debug!("Sent key up: scancode {}", scancode);
-        Ok(())
+        self.enqueue(encode_key(scancode, false))
     }
 
-    /// Sends a mouse motion event
+    /// Queues an absolute pointer position (client/tablet mouse mode).
     pub async fn send_mouse_motion(&mut self, x: i32, y: i32) -> Result<()> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&x.to_le_bytes());
-        data.extend_from_slice(&y.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes()); // button state
-
-        self.connection
-            .send_message(SPICE_MSG_INPUTS_MOUSE_MOTION, &data)
-            .await?;
-        debug!("Sent mouse motion: ({}, {})", x, y);
-        Ok(())
+        self.enqueue(encode_mouse_position(x, y, 0))
     }
 
-    /// Sends a mouse button event
+    /// Queues a mouse button press/release.
     pub async fn send_mouse_button(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
-        let button_mask = match button {
-            MouseButton::Left => SPICE_MOUSE_BUTTON_LEFT,
-            MouseButton::Middle => SPICE_MOUSE_BUTTON_MIDDLE,
-            MouseButton::Right => SPICE_MOUSE_BUTTON_RIGHT,
-            MouseButton::WheelUp => SPICE_MOUSE_BUTTON_WHEEL_UP,
-            MouseButton::WheelDown => SPICE_MOUSE_BUTTON_WHEEL_DOWN,
-        };
-
-        let msg_type = if pressed {
-            SPICE_MSG_INPUTS_MOUSE_PRESS
-        } else {
-            SPICE_MSG_INPUTS_MOUSE_RELEASE
-        };
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&button_mask.to_le_bytes());
-
-        self.connection.send_message(msg_type, &data).await?;
-        debug!(
-            "Sent mouse button: {:?} {}",
-            button,
-            if pressed { "pressed" } else { "released" }
-        );
-        Ok(())
+        self.enqueue(encode_mouse_button(button, pressed))
     }
 
     /// Updates modifier keys state
@@ -225,10 +198,27 @@ impl InputsChannel {
         }
     }
 
+    /// Runs the inputs channel: the sole owner of the socket. It both reads
+    /// server messages and drains the outgoing queue, so external senders never
+    /// need the channel lock this loop holds.
     pub async fn run(&mut self) -> Result<()> {
+        let mut outgoing = self
+            .outgoing_rx
+            .take()
+            .ok_or_else(|| SpiceError::Protocol("inputs run loop already started".into()))?;
         loop {
-            let (header, data) = self.connection.read_message().await?;
-            self.handle_message(&header, &data).await?;
+            tokio::select! {
+                queued = outgoing.recv() => match queued {
+                    Some((msg_type, data)) => {
+                        self.connection.send_message(msg_type, &data).await?;
+                    }
+                    None => return Ok(()), // all senders dropped → shutting down
+                },
+                incoming = self.connection.read_message() => {
+                    let (header, data) = incoming?;
+                    self.handle_message(&header, &data).await?;
+                }
+            }
         }
     }
 
@@ -344,24 +334,89 @@ impl Channel for InputsChannel {
     }
 }
 
-// Inputs channel message types
+// Server -> client inputs messages
 pub const SPICE_MSG_INPUTS_INIT: u16 = 101;
 pub const SPICE_MSG_INPUTS_KEY_MODIFIERS: u16 = 102;
 
-// Client to server messages
-pub const SPICE_MSG_INPUTS_KEY_DOWN: u16 = 103;
-pub const SPICE_MSG_INPUTS_KEY_UP: u16 = 104;
-pub const SPICE_MSG_INPUTS_MOUSE_MOTION: u16 = 105;
-pub const SPICE_MSG_INPUTS_MOUSE_POSITION: u16 = 106;
-pub const SPICE_MSG_INPUTS_MOUSE_PRESS: u16 = 107;
-pub const SPICE_MSG_INPUTS_MOUSE_RELEASE: u16 = 108;
+// Client -> server inputs messages (SpiceMsgcInputs). These differ from the
+// server->client numbers above — the channel direction disambiguates the wire.
+pub const SPICE_MSGC_INPUTS_KEY_DOWN: u16 = 101;
+pub const SPICE_MSGC_INPUTS_KEY_UP: u16 = 102;
+pub const SPICE_MSGC_INPUTS_MOUSE_MOTION: u16 = 111;
+pub const SPICE_MSGC_INPUTS_MOUSE_POSITION: u16 = 112;
+pub const SPICE_MSGC_INPUTS_MOUSE_PRESS: u16 = 113;
+pub const SPICE_MSGC_INPUTS_MOUSE_RELEASE: u16 = 114;
 
-// Mouse button masks
-pub const SPICE_MOUSE_BUTTON_LEFT: u32 = 1 << 0;
-pub const SPICE_MOUSE_BUTTON_MIDDLE: u32 = 1 << 1;
-pub const SPICE_MOUSE_BUTTON_RIGHT: u32 = 1 << 2;
-pub const SPICE_MOUSE_BUTTON_WHEEL_UP: u32 = 1 << 3; // Button 4
-pub const SPICE_MOUSE_BUTTON_WHEEL_DOWN: u32 = 1 << 4; // Button 5
+// Mouse button numbers (SpiceMouseButton), used in PRESS/RELEASE.
+const SPICE_MOUSE_BUTTON_LEFT: u8 = 1;
+const SPICE_MOUSE_BUTTON_MIDDLE: u8 = 2;
+const SPICE_MOUSE_BUTTON_RIGHT: u8 = 3;
+const SPICE_MOUSE_BUTTON_UP: u8 = 4;
+const SPICE_MOUSE_BUTTON_DOWN: u8 = 5;
+
+// Mouse button-state mask bits (buttons currently held).
+const SPICE_MOUSE_BUTTON_MASK_LEFT: u16 = 1 << 0;
+const SPICE_MOUSE_BUTTON_MASK_MIDDLE: u16 = 1 << 1;
+const SPICE_MOUSE_BUTTON_MASK_RIGHT: u16 = 1 << 2;
+const SPICE_MOUSE_BUTTON_MASK_UP: u16 = 1 << 3;
+const SPICE_MOUSE_BUTTON_MASK_DOWN: u16 = 1 << 4;
+
+fn button_number(b: MouseButton) -> u8 {
+    match b {
+        MouseButton::Left => SPICE_MOUSE_BUTTON_LEFT,
+        MouseButton::Middle => SPICE_MOUSE_BUTTON_MIDDLE,
+        MouseButton::Right => SPICE_MOUSE_BUTTON_RIGHT,
+        MouseButton::WheelUp => SPICE_MOUSE_BUTTON_UP,
+        MouseButton::WheelDown => SPICE_MOUSE_BUTTON_DOWN,
+    }
+}
+
+fn button_mask(b: MouseButton) -> u16 {
+    match b {
+        MouseButton::Left => SPICE_MOUSE_BUTTON_MASK_LEFT,
+        MouseButton::Middle => SPICE_MOUSE_BUTTON_MASK_MIDDLE,
+        MouseButton::Right => SPICE_MOUSE_BUTTON_MASK_RIGHT,
+        MouseButton::WheelUp => SPICE_MOUSE_BUTTON_MASK_UP,
+        MouseButton::WheelDown => SPICE_MOUSE_BUTTON_MASK_DOWN,
+    }
+}
+
+/// Encodes a key down/up message: `{ u32 scancode }`.
+pub(crate) fn encode_key(scancode: u32, pressed: bool) -> (u16, Vec<u8>) {
+    let ty = if pressed {
+        SPICE_MSGC_INPUTS_KEY_DOWN
+    } else {
+        SPICE_MSGC_INPUTS_KEY_UP
+    };
+    (ty, scancode.to_le_bytes().to_vec())
+}
+
+/// Encodes an absolute pointer position (client/tablet mouse mode):
+/// `{ u32 x; u32 y; u16 buttons_state; u8 display_id }`.
+pub(crate) fn encode_mouse_position(x: i32, y: i32, buttons_state: u16) -> (u16, Vec<u8>) {
+    let mut data = Vec::with_capacity(11);
+    data.extend_from_slice(&(x.max(0) as u32).to_le_bytes());
+    data.extend_from_slice(&(y.max(0) as u32).to_le_bytes());
+    data.extend_from_slice(&buttons_state.to_le_bytes());
+    data.push(0u8); // display_id
+    (SPICE_MSGC_INPUTS_MOUSE_POSITION, data)
+}
+
+/// Encodes a mouse press/release: `{ u8 button; u16 buttons_state }`.
+pub(crate) fn encode_mouse_button(button: MouseButton, pressed: bool) -> (u16, Vec<u8>) {
+    let ty = if pressed {
+        SPICE_MSGC_INPUTS_MOUSE_PRESS
+    } else {
+        SPICE_MSGC_INPUTS_MOUSE_RELEASE
+    };
+    // ponytail: single-button click model — pressed reports just this button in
+    // the state mask, released reports none. Button chords aren't tracked.
+    let buttons_state = if pressed { button_mask(button) } else { 0 };
+    let mut data = Vec::with_capacity(3);
+    data.push(button_number(button));
+    data.extend_from_slice(&buttons_state.to_le_bytes());
+    (ty, data)
+}
 
 // Keyboard modifier masks
 pub const SPICE_KEYBOARD_MODIFIER_SHIFT: u16 = 1 << 0;
@@ -480,5 +535,38 @@ mod tests {
         modifiers.ctrl = true;
         assert!(modifiers.shift);
         assert!(modifiers.ctrl);
+    }
+
+    #[test]
+    fn test_encode_key_uses_msgc_numbers() {
+        let (ty, data) = encode_key(0x1E, true);
+        assert_eq!(ty, SPICE_MSGC_INPUTS_KEY_DOWN); // 101, not the old 103
+        assert_eq!(data, 0x1Eu32.to_le_bytes().to_vec());
+        assert_eq!(encode_key(0x1E, false).0, SPICE_MSGC_INPUTS_KEY_UP); // 102
+    }
+
+    #[test]
+    fn test_encode_mouse_position_layout() {
+        let (ty, data) = encode_mouse_position(100, 200, 0);
+        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_POSITION); // 112
+        assert_eq!(data.len(), 11);
+        assert_eq!(&data[0..4], &100u32.to_le_bytes());
+        assert_eq!(&data[4..8], &200u32.to_le_bytes());
+        assert_eq!(&data[8..10], &0u16.to_le_bytes());
+        assert_eq!(data[10], 0); // display_id
+        // Negative coords clamp to 0 (avoids u32 wraparound).
+        assert_eq!(&encode_mouse_position(-5, 7, 0).1[0..4], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_encode_mouse_button_layout() {
+        // press left → button number 1, state mask LEFT(0x01)
+        let (ty, data) = encode_mouse_button(MouseButton::Left, true);
+        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_PRESS); // 113
+        assert_eq!(data, vec![1u8, 0x01, 0x00]);
+        // release right → button number 3, no buttons held
+        let (ty2, data2) = encode_mouse_button(MouseButton::Right, false);
+        assert_eq!(ty2, SPICE_MSGC_INPUTS_MOUSE_RELEASE); // 114
+        assert_eq!(data2, vec![3u8, 0x00, 0x00]);
     }
 }
