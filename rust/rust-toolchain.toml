@@ -4,4 +4,4 @@
 # `rustup default`. 1.89.0 matches rdp-kotlin; spice-client's `image` 0.25.10
 # dependency requires rustc >= 1.88, so anything older hard-errors.
 channel = "1.89.0"
-targets = ["aarch64-linux-android", "x86_64-linux-android"]
+targets = ["aarch64-linux-android", "x86_64-linux-android", "armv7-linux-androideabi"]
