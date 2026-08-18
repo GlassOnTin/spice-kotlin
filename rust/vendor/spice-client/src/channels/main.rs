@@ -9,6 +9,10 @@ use tracing::{debug, error, info, warn};
 pub struct MainChannel {
     connection: ChannelConnection,
     session_id: Option<u32>,
+    /// Where to publish the server's negotiated mouse mode so the input path
+    /// can see it. Shared rather than queried, so sending a pointer event
+    /// never has to take this channel's lock. 0 = not yet announced.
+    mouse_mode_sink: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl MainChannel {
@@ -19,6 +23,7 @@ impl MainChannel {
         Ok(Self {
             connection,
             session_id: None,
+            mouse_mode_sink: None,
         })
     }
 
@@ -44,6 +49,7 @@ impl MainChannel {
         Ok(Self {
             connection,
             session_id: None,
+            mouse_mode_sink: None,
         })
     }
 
@@ -68,7 +74,14 @@ impl MainChannel {
         Ok(Self {
             connection,
             session_id: None,
+            mouse_mode_sink: None,
         })
+    }
+
+    /// Wires the shared cell that [`SpiceClientShared`] reads when deciding
+    /// between relative and absolute pointer messages.
+    pub fn set_mouse_mode_sink(&mut self, sink: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        self.mouse_mode_sink = Some(sink);
     }
 
     pub fn get_session_id(&self) -> Option<u32> {
@@ -416,7 +429,13 @@ impl Channel for MainChannel {
                 let mouse_mode = SpiceMsgMainMouseMode::read(&mut cursor)
                     .map_err(|e| SpiceError::Protocol(format!("Failed to parse MouseMode: {e}")))?;
                 info!("Mouse mode changed to: {}", mouse_mode.mode);
-                // TODO: Store mouse mode and notify input handling
+                // Publish it: SPICE_MOUSE_MODE_SERVER (1) means the server
+                // wants RELATIVE deltas, CLIENT (2) absolute positions. Sending
+                // the wrong one is silent — the guest pointer simply never
+                // moves (#549), so this value has to reach the send path.
+                if let Some(sink) = &self.mouse_mode_sink {
+                    sink.store(mouse_mode.mode, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             x if x == MainChannelMessage::MultiMediaTime as u16 => {
                 let mut cursor = std::io::Cursor::new(data);

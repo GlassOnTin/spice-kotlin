@@ -342,6 +342,13 @@ pub const SPICE_MSG_INPUTS_KEY_MODIFIERS: u16 = 102;
 // server->client numbers above — the channel direction disambiguates the wire.
 pub const SPICE_MSGC_INPUTS_KEY_DOWN: u16 = 101;
 pub const SPICE_MSGC_INPUTS_KEY_UP: u16 = 102;
+/// `SPICE_MOUSE_MODE_SERVER` — the server moves the guest pointer from relative
+/// deltas. What a guest with only a PS/2 mouse gets.
+pub const SPICE_MOUSE_MODE_SERVER: u32 = 1;
+/// `SPICE_MOUSE_MODE_CLIENT` — the client sends absolute positions. Requires an
+/// absolute pointing device in the guest (typically a USB tablet).
+pub const SPICE_MOUSE_MODE_CLIENT: u32 = 2;
+
 pub const SPICE_MSGC_INPUTS_MOUSE_MOTION: u16 = 111;
 pub const SPICE_MSGC_INPUTS_MOUSE_POSITION: u16 = 112;
 pub const SPICE_MSGC_INPUTS_MOUSE_PRESS: u16 = 113;
@@ -400,6 +407,40 @@ pub(crate) fn encode_mouse_position(x: i32, y: i32, buttons_state: u16) -> (u16,
     data.extend_from_slice(&buttons_state.to_le_bytes());
     data.push(0u8); // display_id
     (SPICE_MSGC_INPUTS_MOUSE_POSITION, data)
+}
+
+/// Encodes RELATIVE pointer movement: `{ i32 dx; i32 dy; u16 buttons_state }`.
+///
+/// This is what a server in SPICE_MOUSE_MODE_SERVER expects — the mode a guest
+/// gets when it has no absolute pointing device (a PS/2-only VM, e.g. an
+/// older Windows guest). Such a server ignores MOUSE_POSITION entirely, which
+/// is why the pointer used to sit motionless while the keyboard worked (#549).
+pub(crate) fn encode_mouse_motion(dx: i32, dy: i32, buttons_state: u16) -> (u16, Vec<u8>) {
+    let mut data = Vec::with_capacity(10);
+    data.extend_from_slice(&dx.to_le_bytes());
+    data.extend_from_slice(&dy.to_le_bytes());
+    data.extend_from_slice(&buttons_state.to_le_bytes());
+    (SPICE_MSGC_INPUTS_MOUSE_MOTION, data)
+}
+
+/// Picks the pointer message the server actually wants.
+///
+/// The mode is the server's to choose and it never negotiates twice: CLIENT
+/// means absolute positions, SERVER means relative deltas derived from [`last`].
+/// An unannounced mode (0) stays absolute — the pre-existing behaviour, and the
+/// right guess for the tablet-equipped guests that always worked.
+pub(crate) fn encode_pointer(
+    mode: u32,
+    x: i32,
+    y: i32,
+    last: Option<(i32, i32)>,
+) -> (u16, Vec<u8>) {
+    if mode == SPICE_MOUSE_MODE_SERVER {
+        let (dx, dy) = last.map_or((0, 0), |(px, py)| (x - px, y - py));
+        encode_mouse_motion(dx, dy, 0)
+    } else {
+        encode_mouse_position(x, y, 0)
+    }
 }
 
 /// Encodes a mouse press/release: `{ u8 button; u16 buttons_state }`.
@@ -543,6 +584,53 @@ mod tests {
         assert_eq!(ty, SPICE_MSGC_INPUTS_KEY_DOWN); // 101, not the old 103
         assert_eq!(data, 0x1Eu32.to_le_bytes().to_vec());
         assert_eq!(encode_key(0x1E, false).0, SPICE_MSGC_INPUTS_KEY_UP); // 102
+    }
+
+    #[test]
+    fn test_encode_mouse_motion_layout() {
+        // SpiceMsgcMouseMotion is { int32 dx; int32 dy; uint16 buttons_state }
+        // — 10 bytes, and NO display_id, unlike MouseMotion's absolute sibling.
+        let (ty, data) = encode_mouse_motion(-3, 7, 0);
+        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_MOTION); // 111
+        assert_eq!(data.len(), 10);
+        // Deltas are signed: a leftward move must stay negative rather than
+        // clamping to 0 the way absolute coordinates do.
+        assert_eq!(&data[0..4], &(-3i32).to_le_bytes());
+        assert_eq!(&data[4..8], &7i32.to_le_bytes());
+        assert_eq!(&data[8..10], &0u16.to_le_bytes());
+    }
+
+    // The routing itself, which is the actual #549 fix: the encoders were only
+    // ever half the problem — the client also has to pick between them.
+    #[test]
+    fn test_encode_pointer_routes_on_server_mode() {
+        // SERVER mode: relative, and the delta is measured from the last point.
+        let (ty, data) = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, Some((10, 10)));
+        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_MOTION);
+        assert_eq!(&data[0..4], &3i32.to_le_bytes());
+        assert_eq!(&data[4..8], &(-3i32).to_le_bytes());
+
+        // No previous point yet: report no movement rather than a jump from
+        // wherever the pointer happened to be.
+        let (ty, data) = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, None);
+        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_MOTION);
+        assert_eq!(&data[0..4], &0i32.to_le_bytes());
+        assert_eq!(&data[4..8], &0i32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_encode_pointer_stays_absolute_for_client_and_unannounced() {
+        assert_eq!(
+            encode_pointer(SPICE_MOUSE_MODE_CLIENT, 13, 7, Some((10, 10))).0,
+            SPICE_MSGC_INPUTS_MOUSE_POSITION
+        );
+        // Mode 0 = the server has not said yet. Absolute is what shipped before
+        // and is correct for a tablet guest, so an early event must not become
+        // a stray relative delta.
+        assert_eq!(
+            encode_pointer(0, 13, 7, Some((10, 10))).0,
+            SPICE_MSGC_INPUTS_MOUSE_POSITION
+        );
     }
 
     #[test]

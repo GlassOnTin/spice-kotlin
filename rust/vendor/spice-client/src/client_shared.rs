@@ -1,6 +1,8 @@
 use crate::channels::cursor::{CursorChannel, CursorShape};
 use crate::channels::display::DisplayChannel;
-use crate::channels::inputs::{encode_key, encode_mouse_button, encode_mouse_position, InputsChannel};
+use crate::channels::inputs::{
+    encode_key, encode_mouse_button, encode_pointer, InputsChannel, SPICE_MOUSE_MODE_SERVER,
+};
 use crate::channels::main::MainChannel;
 use crate::channels::MouseButton;
 use crate::error::{Result, SpiceError};
@@ -42,6 +44,12 @@ pub struct SpiceClientInner {
     /// lock so sends never deadlock against `InputsChannel::run`.
     inputs_senders: HashMap<u8, mpsc::UnboundedSender<(u16, Vec<u8>)>>,
     cursor_channels: HashMap<u8, Arc<Mutex<CursorChannel>>>,
+    /// The server's announced mouse mode (0 until it says). Written by the main
+    /// channel, read on every pointer event — see [`SpiceClientShared::send_mouse_motion`].
+    mouse_mode: Arc<std::sync::atomic::AtomicU32>,
+    /// Last absolute pointer position, so relative deltas can be derived for a
+    /// server-mode guest from the absolute coordinates the UI layer reports.
+    last_pointer: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
     #[cfg(not(target_arch = "wasm32"))]
     channel_tasks: Vec<JoinHandle<Result<()>>>,
     #[cfg(target_arch = "wasm32")]
@@ -108,6 +116,8 @@ impl SpiceClientShared {
                 session_id: format!("spice-{}", Date::now() as u64),
                 password: None,
                 main_channel: None,
+                mouse_mode: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                last_pointer: Arc::new(std::sync::Mutex::new(None)),
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
                 inputs_senders: HashMap::new(),
@@ -193,6 +203,8 @@ impl SpiceClientShared {
                 session_id,
                 password: None,
                 main_channel: None,
+                mouse_mode: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                last_pointer: Arc::new(std::sync::Mutex::new(None)),
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
                 inputs_senders: HashMap::new(),
@@ -419,7 +431,11 @@ impl SpiceClientShared {
                     }
                 }
 
-                inner.main_channel = Some(Arc::new(Mutex::new(main_channel)));
+                // Let the main channel publish the server's mouse mode into the
+            // cell the pointer path reads; without this it parses the
+            // announcement and drops it, and every guest looks like a tablet.
+            main_channel.set_mouse_mode_sink(inner.mouse_mode.clone());
+            inner.main_channel = Some(Arc::new(Mutex::new(main_channel)));
                 return Ok(());
             }
         }
@@ -539,6 +555,10 @@ impl SpiceClientShared {
                 }
             }
 
+            // Let the main channel publish the server's mouse mode into the
+            // cell the pointer path reads; without this it parses the
+            // announcement and drops it, and every guest looks like a tablet.
+            main_channel.set_mouse_mode_sink(inner.mouse_mode.clone());
             inner.main_channel = Some(Arc::new(Mutex::new(main_channel)));
             Ok(())
         }
@@ -924,10 +944,36 @@ impl SpiceClientShared {
             .await
     }
 
-    /// Sends an absolute pointer position to the specified inputs channel.
+    /// Sends a pointer movement, in whichever form the server asked for.
+    ///
+    /// SPICE picks the mode, not the client: a guest with an absolute pointing
+    /// device (USB tablet) gets CLIENT mode and absolute positions; a guest with
+    /// only a PS/2 mouse gets SERVER mode and RELATIVE deltas, and ignores
+    /// absolute positions completely. Always sending absolute is why the pointer
+    /// was dead on PS/2-only guests while the keyboard worked (#549) — the
+    /// failure is silent, since the server simply drops what it cannot use.
+    ///
+    /// The UI layer reports absolute coordinates either way, so server-mode
+    /// deltas are derived here from the previous position. Before the server has
+    /// announced anything (mode 0) we keep sending absolute, which is the
+    /// pre-existing behaviour and correct for the tablet case.
     pub async fn send_mouse_motion(&self, channel_id: u8, x: i32, y: i32) -> Result<()> {
-        self.enqueue_input(channel_id, encode_mouse_position(x, y, 0))
-            .await
+        let (mode, last) = {
+            let inner = self.inner.lock().await;
+            (inner.mouse_mode.clone(), inner.last_pointer.clone())
+        };
+        let msg = {
+            let mut guard = last.lock().unwrap();
+            let msg = encode_pointer(
+                mode.load(std::sync::atomic::Ordering::Relaxed),
+                x,
+                y,
+                *guard,
+            );
+            *guard = Some((x, y));
+            msg
+        };
+        self.enqueue_input(channel_id, msg).await
     }
 
     /// Sends a mouse button event to the specified inputs channel.

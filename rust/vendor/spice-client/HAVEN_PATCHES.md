@@ -5,6 +5,23 @@ with fixes to its display decoder, which does not render against real QEMU/SPICE
 servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl -spice`.
 
 ## Applied
+- **Mouse mode / relative pointer** (`src/channels/inputs.rs`, `src/channels/main.rs`,
+  `src/client_shared.rs`): the crate only ever sent `MOUSE_POSITION` (absolute),
+  defined `MOUSE_MOTION` (111) without an encoder, and parsed the server's
+  `SPICE_MSG_MAIN_MOUSE_MODE` announcement only to discard it under a
+  `// TODO: Store mouse mode and notify input handling`. A guest with no absolute
+  pointing device (PS/2-only — an older Windows VM) runs the server in
+  SPICE_MOUSE_MODE_SERVER, which ignores absolute positions, so its pointer never
+  moved while the keyboard worked (Haven #549, and the reason #543's "use SPICE's
+  relative pointer" plan had nothing to use). Added `encode_mouse_motion`, made
+  the main channel publish the announced mode into a shared cell, and route each
+  pointer event through `encode_pointer`: relative deltas in server mode,
+  absolute otherwise. Deltas are derived from the previous absolute position,
+  since the UI layer reports absolute either way. An unannounced mode stays
+  absolute — the prior behaviour, and correct for tablet guests.
+  ★Wire format follows spice-protocol's `SpiceMsgcMouseMotion`
+  `{ int32 dx; int32 dy; uint16 buttons_state }` (10 bytes, no `display_id`);
+  unit-tested, NOT yet confirmed against a live PS/2-only server.
 - **`SpiceRect` wire order** (`src/protocol.rs`): was `{left,top,right,bottom}`,
   corrected to SPICE wire order `{top,left,bottom,right}`.
 - **DRAW_COPY parse** (`src/channels/display.rs`): replaced the binrw
