@@ -428,13 +428,19 @@ impl Channel for MainChannel {
                 let mut cursor = std::io::Cursor::new(data);
                 let mouse_mode = SpiceMsgMainMouseMode::read(&mut cursor)
                     .map_err(|e| SpiceError::Protocol(format!("Failed to parse MouseMode: {e}")))?;
-                info!("Mouse mode changed to: {}", mouse_mode.mode);
+                info!(
+                    "Mouse mode changed: current={} supported={:#x}",
+                    mouse_mode.current_mode, mouse_mode.supported_modes
+                );
                 // Publish it: SPICE_MOUSE_MODE_SERVER (1) means the server
                 // wants RELATIVE deltas, CLIENT (2) absolute positions. Sending
                 // the wrong one is silent — the guest pointer simply never
                 // moves (#549), so this value has to reach the send path.
                 if let Some(sink) = &self.mouse_mode_sink {
-                    sink.store(mouse_mode.mode, std::sync::atomic::Ordering::Relaxed);
+                    sink.store(
+                        mouse_mode.current_mode as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
             x if x == MainChannelMessage::MultiMediaTime as u16 => {

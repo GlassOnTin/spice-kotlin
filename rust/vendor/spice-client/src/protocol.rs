@@ -481,7 +481,13 @@ pub struct ChannelId {
 #[brw(little)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SpiceMsgMainMouseMode {
-    pub mode: u32,
+    // Two 16-bit fields per spice.proto's MsgMainMouseMode — NOT one u32.
+    // Reading them as a u32 fused supported|current<<16 into a value that
+    // matched no mode constant, so a PS/2-only guest's SERVER announcement
+    // (supported=1, current=1 → 0x00010001) fell through to absolute and
+    // the guest pointer never moved (#549).
+    pub supported_modes: u16,
+    pub current_mode: u16,
 }
 
 #[binrw]

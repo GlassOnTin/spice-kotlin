@@ -505,3 +505,23 @@ fn test_wait_for_channels_multiple() {
         assert_eq!(channel.id, deserialized.wait_list[idx].id);
     }
 }
+
+#[test]
+fn test_mouse_mode_message_is_two_u16_fields() {
+    // The exact wire bytes a PS/2-only guest (Windows 98 on QEMU, #549)
+    // produces: supported_modes = SERVER (1), current_mode = SERVER (1).
+    // Read as a single little-endian u32 these fuse to 0x00010001, which
+    // matches no mode constant — the regression this test pins.
+    let wire: [u8; 4] = [0x01, 0x00, 0x01, 0x00];
+    let mut cursor = Cursor::new(&wire[..]);
+    let msg = SpiceMsgMainMouseMode::read(&mut cursor).unwrap();
+    assert_eq!(msg.supported_modes, 1);
+    assert_eq!(msg.current_mode, 1);
+
+    // A tablet-equipped guest announcing both modes with CLIENT current.
+    let wire: [u8; 4] = [0x03, 0x00, 0x02, 0x00];
+    let mut cursor = Cursor::new(&wire[..]);
+    let msg = SpiceMsgMainMouseMode::read(&mut cursor).unwrap();
+    assert_eq!(msg.supported_modes, 3);
+    assert_eq!(msg.current_mode, 2);
+}
