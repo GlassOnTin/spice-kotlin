@@ -13,6 +13,12 @@ pub struct MainChannel {
     /// can see it. Shared rather than queried, so sending a pointer event
     /// never has to take this channel's lock. 0 = not yet announced.
     mouse_mode_sink: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Last mouse mode the server announced, kept so a sink attached AFTER
+    /// the announcement still learns it. MAIN_INIT is handled inline during
+    /// this channel's connect, before the client wires the sink — without
+    /// this replay the initial mode is lost and a PS/2-only guest stays on
+    /// absolute positions forever (#549).
+    announced_mouse_mode: Option<u32>,
 }
 
 impl MainChannel {
@@ -24,6 +30,7 @@ impl MainChannel {
             connection,
             session_id: None,
             mouse_mode_sink: None,
+            announced_mouse_mode: None,
         })
     }
 
@@ -50,6 +57,7 @@ impl MainChannel {
             connection,
             session_id: None,
             mouse_mode_sink: None,
+            announced_mouse_mode: None,
         })
     }
 
@@ -75,12 +83,16 @@ impl MainChannel {
             connection,
             session_id: None,
             mouse_mode_sink: None,
+            announced_mouse_mode: None,
         })
     }
 
     /// Wires the shared cell that [`SpiceClientShared`] reads when deciding
     /// between relative and absolute pointer messages.
     pub fn set_mouse_mode_sink(&mut self, sink: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        if let Some(mode) = self.announced_mouse_mode {
+            sink.store(mode, std::sync::atomic::Ordering::Relaxed);
+        }
         self.mouse_mode_sink = Some(sink);
     }
 
@@ -407,6 +419,20 @@ impl Channel for MainChannel {
                 // Store the session_id for use by other channels
                 self.session_id = Some(init_msg.session_id);
 
+                // The initial mouse mode arrives HERE, not via a MOUSE_MODE
+                // message: QEMU sends no standalone announcement at connect
+                // (verified live against QEMU 10 — init carried current=1 and
+                // no MOUSE_MODE followed), so this store is the only thing
+                // that puts a session against a PS/2-only guest into relative
+                // mode (#549). MOUSE_MODE below still handles later changes.
+                self.announced_mouse_mode = Some(init_msg.current_mouse_mode);
+                if let Some(sink) = &self.mouse_mode_sink {
+                    sink.store(
+                        init_msg.current_mouse_mode,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
                 // NOTE: The debug server rejects SPICE_MSGC_MAIN_CLIENT_INFO (type 101)
                 // with "invalid message type". This might be because:
                 // 1. The message type value is wrong
@@ -436,9 +462,10 @@ impl Channel for MainChannel {
                 // wants RELATIVE deltas, CLIENT (2) absolute positions. Sending
                 // the wrong one is silent — the guest pointer simply never
                 // moves (#549), so this value has to reach the send path.
+                self.announced_mouse_mode = Some(u32::from(mouse_mode.current_mode));
                 if let Some(sink) = &self.mouse_mode_sink {
                     sink.store(
-                        mouse_mode.current_mode as u32,
+                        u32::from(mouse_mode.current_mode),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }

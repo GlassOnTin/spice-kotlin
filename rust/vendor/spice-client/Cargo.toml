@@ -293,3 +293,7 @@ async_fn_in_trait = "allow"
 dead_code = "allow"
 unused_imports = "allow"
 unused_variables = "allow"
+
+[[example]]
+name = "ps2_probe"
+path = "examples/ps2_probe.rs"

@@ -525,3 +525,25 @@ fn test_mouse_mode_message_is_two_u16_fields() {
     assert_eq!(msg.supported_modes, 3);
     assert_eq!(msg.current_mode, 2);
 }
+
+#[test]
+fn test_main_init_carries_the_initial_mouse_mode() {
+    // The initial mouse mode is delivered in MSG_MAIN_INIT, not via a
+    // standalone MOUSE_MODE message (QEMU sends none at connect — verified
+    // live, #549). current_mouse_mode sits at byte offset 12. Values mirror
+    // the live QEMU capture: supported=1, current=1 (SERVER), agent absent.
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&0xDEC0DEu32.to_le_bytes()); // session_id
+    wire.extend_from_slice(&1u32.to_le_bytes()); // display_channels_hint
+    wire.extend_from_slice(&1u32.to_le_bytes()); // supported_mouse_modes
+    wire.extend_from_slice(&1u32.to_le_bytes()); // current_mouse_mode
+    wire.extend_from_slice(&0u32.to_le_bytes()); // agent_connected
+    wire.extend_from_slice(&0u32.to_le_bytes()); // agent_tokens
+    wire.extend_from_slice(&0u32.to_le_bytes()); // multi_media_time
+    wire.extend_from_slice(&0u32.to_le_bytes()); // ram_hint
+    let mut cursor = Cursor::new(&wire[..]);
+    let msg = SpiceMsgMainInit::read(&mut cursor).unwrap();
+    assert_eq!(msg.session_id, 0xDEC0DE);
+    assert_eq!(msg.supported_mouse_modes, 1);
+    assert_eq!(msg.current_mouse_mode, 1);
+}
