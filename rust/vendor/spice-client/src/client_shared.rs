@@ -50,6 +50,9 @@ pub struct SpiceClientInner {
     /// Last absolute pointer position, so relative deltas can be derived for a
     /// server-mode guest from the absolute coordinates the UI layer reports.
     last_pointer: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    /// Pointer-message flow control shared with each inputs channel's ack
+    /// handler (#572).
+    motion_flow: Arc<crate::channels::inputs::MotionFlow>,
     #[cfg(not(target_arch = "wasm32"))]
     channel_tasks: Vec<JoinHandle<Result<()>>>,
     #[cfg(target_arch = "wasm32")]
@@ -118,6 +121,7 @@ impl SpiceClientShared {
                 main_channel: None,
                 mouse_mode: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 last_pointer: Arc::new(std::sync::Mutex::new(None)),
+                motion_flow: Arc::new(crate::channels::inputs::MotionFlow::default()),
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
                 inputs_senders: HashMap::new(),
@@ -205,6 +209,7 @@ impl SpiceClientShared {
                 main_channel: None,
                 mouse_mode: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 last_pointer: Arc::new(std::sync::Mutex::new(None)),
+                motion_flow: Arc::new(crate::channels::inputs::MotionFlow::default()),
                 display_channels: HashMap::new(),
                 inputs_channels: HashMap::new(),
                 inputs_senders: HashMap::new(),
@@ -507,13 +512,20 @@ impl SpiceClientShared {
                         );
 
                         // According to SPICE protocol: non-main channels use session_id as connection_id
-                        let inputs_channel = InputsChannel::new_with_connection_id(
+                        let mut inputs_channel = InputsChannel::new_with_connection_id(
                             &inner.host,
                             inner.port,
                             channel_id,
                             session_id,
                         )
                         .await?;
+                        // #572: give the ack handler the same cells the send
+                        // path uses, so pointer pacing spans both.
+                        inputs_channel.set_motion_flow(
+                            inner.motion_flow.clone(),
+                            inner.mouse_mode.clone(),
+                            inner.last_pointer.clone(),
+                        );
                         inner
                             .inputs_senders
                             .insert(channel_id, inputs_channel.outgoing_sender());
@@ -958,10 +970,20 @@ impl SpiceClientShared {
     /// announced anything (mode 0) we keep sending absolute, which is the
     /// pre-existing behaviour and correct for the tablet case.
     pub async fn send_mouse_motion(&self, channel_id: u8, x: i32, y: i32) -> Result<()> {
-        let (mode, last) = {
+        let (mode, last, flow) = {
             let inner = self.inner.lock().await;
-            (inner.mouse_mode.clone(), inner.last_pointer.clone())
+            (
+                inner.mouse_mode.clone(),
+                inner.last_pointer.clone(),
+                inner.motion_flow.clone(),
+            )
         };
+        // #572: pace pointer messages against the server's acks. When the
+        // window is full the target is parked and the inputs channel's ack
+        // handler flushes it, so a drag's final position always lands.
+        if !flow.try_acquire(x, y) {
+            return Ok(());
+        }
         let msg = {
             let mut guard = last.lock().unwrap();
             let msg = encode_pointer(

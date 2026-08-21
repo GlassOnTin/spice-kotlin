@@ -13,6 +13,57 @@ pub enum MouseMode {
     Client,
 }
 
+/// The server acknowledges every bunch of this many pointer messages
+/// (spice.proto: SPICE_INPUT_MOTION_ACK_BUNCH).
+pub const SPICE_INPUT_MOTION_ACK_BUNCH: u32 = 4;
+
+/// How many unacknowledged pointer messages the client lets onto the wire
+/// before it starts coalescing (#572). Two ack bunches: enough to keep the
+/// pipe full at drag rate, small enough that a slow guest (QEMU's 3-byte
+/// PS/2 packet queue drained at guest polling rate) stops receiving a
+/// backlog it will replay as lag, then a stall.
+pub const MOTION_OUTSTANDING_LIMIT: u32 = 2 * SPICE_INPUT_MOTION_ACK_BUNCH;
+
+/// Shared pointer-message flow control (#572). The send path acquires a slot
+/// per pointer message; when the window is full the newest target coordinates
+/// are parked (overwriting any older parked ones — only the latest matters
+/// for a pointer) and flushed by the ack handler.
+#[derive(Debug, Default)]
+pub struct MotionFlow {
+    outstanding: std::sync::atomic::AtomicU32,
+    pending: std::sync::Mutex<Option<(i32, i32)>>,
+}
+
+impl MotionFlow {
+    /// Try to claim a wire slot for a pointer message to (x, y). Returns true
+    /// if the caller should send now; false means the coordinates were parked
+    /// for the ack handler to flush.
+    pub fn try_acquire(&self, x: i32, y: i32) -> bool {
+        use std::sync::atomic::Ordering;
+        // The +1 races with concurrent senders are harmless: the limit is a
+        // soft pacing bound, not a protocol invariant.
+        if self.outstanding.load(Ordering::Relaxed) < MOTION_OUTSTANDING_LIMIT {
+            self.outstanding.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            *self.pending.lock().unwrap() = Some((x, y));
+            false
+        }
+    }
+
+    /// Record a server ack (one bunch worth of credit) and take any parked
+    /// coordinates for the caller to send.
+    pub fn on_ack(&self) -> Option<(i32, i32)> {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .outstanding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(SPICE_INPUT_MOTION_ACK_BUNCH))
+            });
+        self.pending.lock().unwrap().take()
+    }
+}
+
 /// Inputs channel for sending keyboard and mouse events
 pub struct InputsChannel {
     pub(crate) connection: ChannelConnection,
@@ -23,6 +74,13 @@ pub struct InputsChannel {
     /// run-loop's channel lock (which previously deadlocked every input).
     outgoing_tx: mpsc::UnboundedSender<(u16, Vec<u8>)>,
     outgoing_rx: Option<mpsc::UnboundedReceiver<(u16, Vec<u8>)>>,
+    /// Pointer flow control shared with the send path (#572), plus clones of
+    /// the client's mode/last-position cells so a parked pointer target can be
+    /// encoded and flushed from the ack handler. None until the client wires
+    /// them after construction; without them acks only log.
+    motion_flow: Option<std::sync::Arc<MotionFlow>>,
+    flush_mode: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    flush_last: Option<std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -113,7 +171,24 @@ impl InputsChannel {
             modifiers: KeyModifiers::default(),
             outgoing_tx,
             outgoing_rx: Some(outgoing_rx),
+            motion_flow: None,
+            flush_mode: None,
+            flush_last: None,
         }
+    }
+
+    /// Wires the shared pointer flow control (#572). Called by the client
+    /// right after this channel is constructed, with the same cells the send
+    /// path uses, so the ack handler can flush a parked pointer target.
+    pub(crate) fn set_motion_flow(
+        &mut self,
+        flow: std::sync::Arc<MotionFlow>,
+        mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        last: std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    ) {
+        self.motion_flow = Some(flow);
+        self.flush_mode = Some(mode);
+        self.flush_last = Some(last);
     }
 
     /// Clonable handle to enqueue outgoing input messages without touching the
@@ -259,6 +334,32 @@ impl Channel for InputsChannel {
                 debug!("Received key modifiers");
                 self.handle_modifiers_message(data).await?;
             }
+            SPICE_MSG_INPUTS_MOUSE_MOTION_ACK => {
+                // #572: one bunch of pointer credit back; flush any parked
+                // target so a drag that ended while the window was full still
+                // lands on its final position instead of freezing short.
+                if let Some(flow) = &self.motion_flow {
+                    if let Some((x, y)) = flow.on_ack() {
+                        if let (Some(mode), Some(last)) = (&self.flush_mode, &self.flush_last) {
+                            let msg = {
+                                let mut guard = last.lock().unwrap();
+                                let msg = encode_pointer(
+                                    mode.load(std::sync::atomic::Ordering::Relaxed),
+                                    x,
+                                    y,
+                                    *guard,
+                                );
+                                *guard = Some((x, y));
+                                msg
+                            };
+                            let _ = flow.try_acquire(x, y); // count the flush against the window
+                            let _ = self.outgoing_tx.send(msg);
+                        }
+                    }
+                } else {
+                    debug!("Motion ack received before flow control wired");
+                }
+            }
             x if x == SPICE_MSG_SET_ACK => {
                 debug!("Received SET_ACK message in inputs channel");
                 if data.len() >= 4 {
@@ -337,6 +438,9 @@ impl Channel for InputsChannel {
 // Server -> client inputs messages
 pub const SPICE_MSG_INPUTS_INIT: u16 = 101;
 pub const SPICE_MSG_INPUTS_KEY_MODIFIERS: u16 = 102;
+/// Sent by the server after every SPICE_INPUT_MOTION_ACK_BUNCH pointer
+/// messages; previously fell through to "Unknown inputs message type" (#572).
+pub const SPICE_MSG_INPUTS_MOUSE_MOTION_ACK: u16 = 111;
 
 // Client -> server inputs messages (SpiceMsgcInputs). These differ from the
 // server->client numbers above — the channel direction disambiguates the wire.
@@ -656,5 +760,28 @@ mod tests {
         let (ty2, data2) = encode_mouse_button(MouseButton::Right, false);
         assert_eq!(ty2, SPICE_MSGC_INPUTS_MOUSE_RELEASE); // 114
         assert_eq!(data2, vec![3u8, 0x00, 0x00]);
+    }
+}
+
+#[cfg(test)]
+mod motion_flow_tests {
+    use super::*;
+
+    #[test]
+    fn window_fills_then_parks_and_ack_releases() {
+        let flow = MotionFlow::default();
+        // The full window sends freely.
+        for i in 0..MOTION_OUTSTANDING_LIMIT {
+            assert!(flow.try_acquire(i as i32, 0), "slot {i} should send");
+        }
+        // Over the window: parked, newest coordinates win.
+        assert!(!flow.try_acquire(100, 100));
+        assert!(!flow.try_acquire(200, 200));
+        // One ack releases a bunch of credit and yields the newest parked target.
+        assert_eq!(flow.on_ack(), Some((200, 200)));
+        // Credit is back: the next pointer message sends.
+        assert!(flow.try_acquire(201, 200));
+        // Nothing parked now; an ack yields no flush.
+        assert_eq!(flow.on_ack(), None);
     }
 }
