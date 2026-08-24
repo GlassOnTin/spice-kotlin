@@ -5,6 +5,33 @@ with fixes to its display decoder, which does not render against real QEMU/SPICE
 servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl -spice`.
 
 ## Applied
+- **A ticketed SPICE server could never be reached** (`src/client_shared.rs`,
+  `src/channels/{main,display,inputs,cursor}.rs`): `set_password` stored the ticket
+  on the shared client, but only the **WebSocket/WASM** constructors ever read it.
+  The native path built every channel with `MainChannel::new(host, port)` /
+  `new_with_connection_id(host, port, channel_id, session_id)` — no password
+  argument existed — so the link exchange fell to `"No password provided,
+  encrypting empty string"` and the server answered
+  `SPICE_LINK_ERR_PERMISSION_DENIED`. Haven collects a ticket in its SPICE profile
+  editor and passed it all the way down to `set_password`, where it stopped.
+  Haven #584.
+
+  The password is now a **parameter** on the native constructors rather than a
+  setter to remember, so a new call site cannot quietly omit it, and it is applied
+  before `handshake()` — after that the ticket is already too late to matter.
+  All four channels need it, not just main: a QEMU server logs the encryption
+  four times (main, display, inputs, cursor).
+
+  Verified against `qemu -spice password-secret=...`: correct password connects
+  and streams frames; **wrong** password and **absent** password are both still
+  refused with error 7. The negative controls matter here — a client that ignored
+  tickets entirely would also "pass" a connect test against an unticketed server.
+
+  ★No CI regression test. Proving the ticket is *sent* needs a fake SPICE server
+  that completes the link exchange and decrypts the 128-byte RSA blob; anything
+  cheaper asserts the setter was called rather than that the wire carries it, and
+  would pass while broken. Compile-time enforcement plus the live check is what
+  stands behind this today. A fake-server test is worth writing — see TODO.
 - **Primary surface size / `SURFACE_CREATE` was being discarded** (`src/protocol.rs`,
   `src/channels/display.rs`): the crate recorded `SPICE_MSG_DISPLAY_SURFACE_CREATE`
   as 318 and `DisplayChannelMessage::DrawAlphaBlend` as 317, both four higher than
@@ -262,6 +289,9 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 0 decode warnings, frame pixel-correct).
 
 ## TODO (in progress)
+- Fake-SPICE-server test for the ticket path (#584): accept a link, present an RSA
+  key, decrypt the client's reply and assert it is the password, not the empty
+  string. Would have caught the native/WebSocket split.
 - LZ4 (109) image decoder.
 - QUIC GRAY (1) / RGB16 (2) sub-types (only RGB24/RGB32/RGBA decoded so far — the 5bpc
   family / single-plane paths are unported; a real server would have to force them).

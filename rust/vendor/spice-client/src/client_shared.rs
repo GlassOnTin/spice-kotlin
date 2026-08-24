@@ -452,7 +452,13 @@ impl SpiceClientShared {
                 inner.host, inner.port
             );
 
-            let mut main_channel = MainChannel::new(&inner.host, inner.port).await?;
+            // The ticket has to reach every channel's link exchange. It used
+            // to be stored on `inner` and read only by the WebSocket path, so
+            // a native client always authenticated with the empty string and
+            // any password-protected server refused it (#584).
+            let mut main_channel =
+                MainChannel::new_with_password(&inner.host, inner.port, inner.password.clone())
+                    .await?;
             main_channel.initialize().await?;
 
             // Get the session_id from main channel
@@ -494,6 +500,7 @@ impl SpiceClientShared {
                             inner.port,
                             channel_id,
                             session_id,
+                            inner.password.clone(),
                         )
                         .await?;
                         inner
@@ -517,6 +524,7 @@ impl SpiceClientShared {
                             inner.port,
                             channel_id,
                             session_id,
+                            inner.password.clone(),
                         )
                         .await?;
                         // #572: give the ack handler the same cells the send
@@ -550,6 +558,7 @@ impl SpiceClientShared {
                             inner.port,
                             channel_id,
                             session_id,
+                            inner.password.clone(),
                         )
                         .await?;
                         inner

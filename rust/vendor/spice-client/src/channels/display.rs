@@ -104,19 +104,27 @@ pub struct DisplayChannel {
 
 impl DisplayChannel {
     pub async fn new(host: &str, port: u16, channel_id: u8) -> Result<Self> {
-        Self::new_with_connection_id(host, port, channel_id, None).await
+        Self::new_with_connection_id(host, port, channel_id, None, None).await
     }
 
+    /// `password` is a parameter rather than a setter on purpose: every native
+    /// channel has to authenticate, and a ticket applied after `handshake()`
+    /// is applied too late to matter. Making it explicit means a new call site
+    /// cannot quietly forget it.
     pub async fn new_with_connection_id(
         host: &str,
         port: u16,
         channel_id: u8,
         connection_id: Option<u32>,
+        password: Option<String>,
     ) -> Result<Self> {
         let mut connection =
             ChannelConnection::new(host, port, ChannelType::Display, channel_id).await?;
         if let Some(conn_id) = connection_id {
             connection.set_connection_id(conn_id);
+        }
+        if let Some(password) = password {
+            connection.set_password(password);
         }
         connection.handshake().await?;
 

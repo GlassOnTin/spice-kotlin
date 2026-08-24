@@ -23,7 +23,23 @@ pub struct MainChannel {
 
 impl MainChannel {
     pub async fn new(host: &str, port: u16) -> Result<Self> {
+        Self::new_with_password(host, port, None).await
+    }
+
+    /// Native constructor that can carry a ticket.
+    ///
+    /// The password has to be on the connection BEFORE `handshake()`, because
+    /// the ticket is encrypted and sent inside the link exchange. There is no
+    /// second chance afterwards — the server has already refused by then.
+    pub async fn new_with_password(
+        host: &str,
+        port: u16,
+        password: Option<String>,
+    ) -> Result<Self> {
         let mut connection = ChannelConnection::new(host, port, ChannelType::Main, 0).await?;
+        if let Some(password) = password {
+            connection.set_password(password);
+        }
         connection.handshake().await?;
 
         Ok(Self {

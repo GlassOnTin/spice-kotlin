@@ -164,7 +164,10 @@ impl SpiceClient {
                 match channel_type {
                     ChannelType::Display => {
                         let display_channel = DisplayChannel::new_with_connection_id(
-                            &self.host, self.port, channel_id, session_id,
+                            // No ticket: this legacy client has no password of
+                            // its own. SpiceClientShared is the one Haven uses
+                            // and the one that carries it (#584).
+                            &self.host, self.port, channel_id, session_id, None,
                         )
                         .await?;
                         self.display_channels.insert(channel_id, display_channel);
