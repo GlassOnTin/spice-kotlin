@@ -5,6 +5,33 @@ with fixes to its display decoder, which does not render against real QEMU/SPICE
 servers as published. Verified empirically against `qemu-system-x86_64 -vga qxl -spice`.
 
 ## Applied
+- **Primary surface size / `SURFACE_CREATE` was being discarded** (`src/protocol.rs`,
+  `src/channels/display.rs`): the crate recorded `SPICE_MSG_DISPLAY_SURFACE_CREATE`
+  as 318 and `DisplayChannelMessage::DrawAlphaBlend` as 317, both four higher than
+  the wire puts them. The draw arm matches the range
+  `DrawFill(302)..=DrawAlphaBlend(317)`, so the server's real SurfaceCreate (314)
+  landed inside it and fell out of the inner match as
+  `debug!("Unhandled draw message type: 314")`. With the announcement lost the
+  channel never left the hard-coded 1024x768 default surface it builds in its
+  constructor, and `blit_to_surface` clamps to the surface, so every guest was
+  silently cropped to a 1024x768 top-left box for the life of the session.
+  Reported as a SPICE display defect on Haven #572 ("only shows the upper left
+  part of the screen ... aprox 1024x768?") — the reporter's guess was the constant.
+
+  Measured, not inferred: `qemu-system-x86_64 -vga qxl -spice` whose QMP
+  `screendump` reports `P6 720 400` sent type 314 with the 20-byte body
+  `00000000 d0020000 90010000 20000000 01000000` = surface_id 0, 720x400,
+  format 32, flags PRIMARY. Before the change the client reported every frame as
+  `1024x768 non-black=2%`; after, `720x400 non-black=6%`, matching the screendump.
+
+  Deliberately narrow: only message 314 is re-routed, by testing its arm before
+  the draw range rather than renumbering the enum. The other members keep the
+  same skew, because nothing on the rig exercised them and a wrong number there
+  would decode a message as the wrong kind instead of merely ignoring it. A stale
+  `SURFACE_DESTROY` is harmless for resizes — the server sends destroy-then-create
+  and the create alone replaces the surface. Regression test pins the captured
+  bytes, not just the constant:
+  `display::tests::primary_surface_create_is_message_314_and_carries_the_servers_real_size`.
 - **Mouse mode / relative pointer** (`src/channels/inputs.rs`, `src/channels/main.rs`,
   `src/client_shared.rs`): the crate only ever sent `MOUSE_POSITION` (absolute),
   defined `MOUSE_MOTION` (111) without an encoder, and parsed the server's
@@ -241,7 +268,9 @@ the GLZ enablement entry under "Applied" (Windows Server 2025, ~115 GLZ images/p
 - FROM_CACHE (103) real-traffic check against a 2D-accel QXL guest (decode implemented;
   modern Windows QXL is display-only so no cache hints — see the FROM_CACHE entry above).
 - LZ_RGB16 / LZ_PLT sub-types (only RGB24/RGB32/RGBA decoded so far).
-- Multi-surface (SURFACE_CREATE/DESTROY) — Phase H. (Cursor shapes done — Phase G;
+- Multi-surface (SURFACE_DESTROY, secondary surfaces) — Phase H. (Primary SURFACE_CREATE
+  now handled — see the Applied entry; it had been arriving all along and being
+  dropped, which is why this read as unimplemented. Cursor shapes done — Phase G;
   FILL/OPAQUE/COPY_BITS draw ops done — Phase F.)
 - COLOR4/8/16/24/32 cursor types (only ALPHA + MONO decoded so far).
 - Live-wire validation of DRAW_FILL/DRAW_OPAQUE (2D-drawing Linux SPICE guest) and of

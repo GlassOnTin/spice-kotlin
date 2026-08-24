@@ -419,7 +419,20 @@ pub const SPICE_MSG_DISPLAY_DRAW_STROKE: u16 = 310;
 pub const SPICE_MSG_DISPLAY_DRAW_TEXT: u16 = 311;
 pub const SPICE_MSG_DISPLAY_DRAW_TRANSPARENT: u16 = 312;
 pub const SPICE_MSG_DISPLAY_DRAW_ALPHA_BLEND: u16 = 317;
-pub const SPICE_MSG_DISPLAY_SURFACE_CREATE: u16 = 318;
+// Observed on the wire, not taken from a header: a QEMU/QXL server announcing a
+// 720x400 primary sends type 314 with the 20-byte body
+// `00000000 d0020000 90010000 20000000 01000000` = surface_id 0, width 720,
+// height 400, format 32, flags PRIMARY — matching that VM's own screendump.
+// It was 318 here, so every primary-surface announcement was dropped as an
+// unhandled draw and the display stayed on the hard-coded 1024x768 default
+// surface for the life of the session, cropping every guest to its top-left
+// corner (#572).
+//
+// The neighbours below still carry the same +4 skew this one had, but nothing
+// exercised them on the test rig, so they are left alone rather than corrected
+// by guesswork. A wrong SURFACE_DESTROY is harmless for the resize path: the
+// server sends destroy-then-create, and the create alone replaces the surface.
+pub const SPICE_MSG_DISPLAY_SURFACE_CREATE: u16 = 314;
 pub const SPICE_MSG_DISPLAY_SURFACE_DESTROY: u16 = 319;
 pub const SPICE_MSG_DISPLAY_MONITORS_CONFIG: u16 = 320;
 pub const SPICE_MSG_DISPLAY_DRAW_COMPOSITE: u16 = 321;

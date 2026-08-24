@@ -1695,18 +1695,6 @@ impl Channel for DisplayChannel {
                     cache_size
                 );
             }
-            x if (DisplayChannelMessage::DrawFill as u16
-                ..=DisplayChannelMessage::DrawAlphaBlend as u16)
-                .contains(&x) =>
-            {
-                self.handle_draw_message(header.msg_type, data).await?;
-            }
-            x if (DisplayChannelMessage::StreamCreate as u16
-                ..=DisplayChannelMessage::StreamDestroyAll as u16)
-                .contains(&x) =>
-            {
-                self.handle_stream_message(header.msg_type, data).await?;
-            }
             x if x == SPICE_MSG_DISPLAY_SURFACE_CREATE => {
                 debug!("Received surface create");
                 let mut cursor = std::io::Cursor::new(data);
@@ -1736,6 +1724,30 @@ impl Channel for DisplayChannel {
 
                 // Notify about new surface
                 self.notify_update(surface_create.surface_id);
+            }
+            // Must be tested BEFORE the draw range below. `DrawAlphaBlend` is
+            // recorded as 317 in this crate, four higher than the wire puts it,
+            // so the range 302..=317 swallows SurfaceCreate (314, confirmed
+            // against a live QEMU/QXL server) and it was being discarded as an
+            // unhandled draw. With the announcement lost the channel kept its
+            // hard-coded 1024x768 default surface for the whole session and
+            // every guest was cropped to that box (#572).
+            //
+            // Only this one message is re-routed. The rest of the skewed range
+            // keeps its existing behaviour because nothing on the test rig
+            // exercised it, and guessing the other numbers would risk decoding
+            // a message as the wrong kind rather than merely ignoring it.
+            x if (DisplayChannelMessage::DrawFill as u16
+                ..=DisplayChannelMessage::DrawAlphaBlend as u16)
+                .contains(&x) =>
+            {
+                self.handle_draw_message(header.msg_type, data).await?;
+            }
+            x if (DisplayChannelMessage::StreamCreate as u16
+                ..=DisplayChannelMessage::StreamDestroyAll as u16)
+                .contains(&x) =>
+            {
+                self.handle_stream_message(header.msg_type, data).await?;
             }
             x if x == SPICE_MSG_DISPLAY_SURFACE_DESTROY => {
                 debug!("Received surface destroy");
@@ -1970,6 +1982,41 @@ mod tests {
     // GLZ control bytes below are hand-derived from spice-gtk decode-glz-tmpl.c
     // (the authoritative reference), not from this crate's encoder — so the
     // expectations test that our decoder matches the reference, not itself.
+
+    /// Bytes captured off the wire from `qemu-system-x86_64 -vga qxl -spice`
+    /// whose own QMP `screendump` reported a 720x400 framebuffer. The server
+    /// sent this as message type 314 while the crate's constant said 318, so
+    /// the announcement fell through to the "unhandled draw" arm and the
+    /// display kept the hard-coded 1024x768 default surface — every guest
+    /// cropped to its top-left corner (#572).
+    ///
+    /// Pinning the captured bytes rather than the constant alone means the test
+    /// fails if either the number or the body layout drifts.
+    #[test]
+    fn primary_surface_create_is_message_314_and_carries_the_servers_real_size() {
+        let captured: [u8; 20] = [
+            0x00, 0x00, 0x00, 0x00, // surface_id 0 (primary)
+            0xd0, 0x02, 0x00, 0x00, // width  720
+            0x90, 0x01, 0x00, 0x00, // height 400
+            0x20, 0x00, 0x00, 0x00, // format 32bpp
+            0x01, 0x00, 0x00, 0x00, // flags  PRIMARY
+        ];
+
+        assert_eq!(
+            314, SPICE_MSG_DISPLAY_SURFACE_CREATE,
+            "the QXL server announced its primary surface as type 314",
+        );
+
+        let parsed = SpiceMsgSurfaceCreate::read(&mut Cursor::new(&captured[..]))
+            .expect("captured SurfaceCreate body must decode");
+        assert_eq!(0, parsed.surface_id);
+        assert_eq!(720, parsed.width, "must be the server's width, not a default");
+        assert_eq!(400, parsed.height, "must be the server's height, not a default");
+
+        // The default surface this replaces. If these ever coincided the test
+        // could pass while the bug was still present.
+        assert_ne!((1024, 768), (parsed.width, parsed.height));
+    }
 
     #[test]
     fn glz_literal_then_same_image_run() {
