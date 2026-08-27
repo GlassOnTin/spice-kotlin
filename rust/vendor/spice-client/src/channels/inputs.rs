@@ -39,11 +39,20 @@ impl MotionFlow {
     /// if the caller should send now; false means the coordinates were parked
     /// for the ack handler to flush.
     pub fn try_acquire(&self, x: i32, y: i32) -> bool {
+        self.try_acquire_n(1, x, y)
+    }
+
+    /// Claim `n` wire slots for one pointer movement split across `n` packets
+    /// (#572). A movement only fits the window as a whole: sending it partly
+    /// would desync the client's tracked position from the guest's, so when
+    /// the window is too tight the whole target is parked and retried on the
+    /// next ack.
+    pub fn try_acquire_n(&self, n: u32, x: i32, y: i32) -> bool {
         use std::sync::atomic::Ordering;
-        // The +1 races with concurrent senders are harmless: the limit is a
+        // The += races with concurrent senders are harmless: the limit is a
         // soft pacing bound, not a protocol invariant.
-        if self.outstanding.load(Ordering::Relaxed) < MOTION_OUTSTANDING_LIMIT {
-            self.outstanding.fetch_add(1, Ordering::Relaxed);
+        if self.outstanding.load(Ordering::Relaxed) + n <= MOTION_OUTSTANDING_LIMIT {
+            self.outstanding.fetch_add(n, Ordering::Relaxed);
             true
         } else {
             *self.pending.lock().unwrap() = Some((x, y));
@@ -51,16 +60,25 @@ impl MotionFlow {
         }
     }
 
-    /// Record a server ack (one bunch worth of credit) and take any parked
-    /// coordinates for the caller to send.
-    pub fn on_ack(&self) -> Option<(i32, i32)> {
+    /// Record a server ack (one bunch worth of credit).
+    pub fn on_ack(&self) {
         use std::sync::atomic::Ordering;
         let _ = self
             .outstanding
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(SPICE_INPUT_MOTION_ACK_BUNCH))
             });
+    }
+
+    /// Take any parked pointer target for the caller to encode and send.
+    pub fn take_pending(&self) -> Option<(i32, i32)> {
         self.pending.lock().unwrap().take()
+    }
+
+    /// Park a target for the ack handler to flush later (used when a snap
+    /// exceeded the window and only part of it could be sent).
+    pub fn park_pending(&self, x: i32, y: i32) {
+        *self.pending.lock().unwrap() = Some((x, y));
     }
 }
 
@@ -347,21 +365,40 @@ impl Channel for InputsChannel {
                 // target so a drag that ended while the window was full still
                 // lands on its final position instead of freezing short.
                 if let Some(flow) = &self.motion_flow {
-                    if let Some((x, y)) = flow.on_ack() {
+                    flow.on_ack();
+                    if let Some((x, y)) = flow.take_pending() {
                         if let (Some(mode), Some(last)) = (&self.flush_mode, &self.flush_last) {
-                            let msg = {
-                                let mut guard = last.lock().unwrap();
-                                let msg = encode_pointer(
-                                    mode.load(std::sync::atomic::Ordering::Relaxed),
-                                    x,
-                                    y,
-                                    *guard,
-                                );
-                                *guard = Some((x, y));
-                                msg
+                            let (mv, prev) = {
+                                let guard = last.lock().unwrap();
+                                let prev = *guard;
+                                (
+                                    encode_pointer(
+                                        mode.load(std::sync::atomic::Ordering::Relaxed),
+                                        x,
+                                        y,
+                                        prev,
+                                    ),
+                                    prev,
+                                )
                             };
-                            let _ = flow.try_acquire(x, y); // count the flush against the window
-                            let _ = self.outgoing_tx.send(msg);
+                            if flow.try_acquire_n(mv.packets.len() as u32, x, y) {
+                                // Advance `last` to where the guest actually
+                                // ended up (`reached` is relative to `prev`);
+                                // if the snap exceeded the window the
+                                // remainder stays ahead and the next ack
+                                // walks it off packet-by-packet.
+                                *last.lock().unwrap() = Some(if mv.complete {
+                                    (x, y)
+                                } else {
+                                    let (px, py) = prev.unwrap_or((0, 0));
+                                    (px + mv.reached.0, py + mv.reached.1)
+                                });
+                                for msg in mv.packets {
+                                    let _ = self.outgoing_tx.send(msg);
+                                }
+                            } else {
+                                // Still no room: try_acquire_n re-parked (x, y).
+                            }
                         }
                     }
                 } else {
@@ -535,7 +572,23 @@ pub(crate) fn encode_mouse_motion(dx: i32, dy: i32, buttons_state: u16) -> (u16,
     (SPICE_MSGC_INPUTS_MOUSE_MOTION, data)
 }
 
-/// Picks the pointer message the server actually wants.
+/// One pointer movement's worth of wire packets, plus what the guest actually
+/// ends up reaching.
+///
+/// SERVER mode can carry more than one message: a fast swipe arrives as one UI
+/// event with a delta far beyond what the PS/2 wire carries, so it is split
+/// into ≤127-per-packet steps (see [`split_motion`]). When the movement is
+/// larger than the flow window can hold at once, only the first
+/// `MOTION_OUTSTANDING_LIMIT` packets are returned and `complete` is false:
+/// `reached` is where the guest will be after these packets, and the caller
+/// parks the final target so the ack handler flushes the remainder.
+pub(crate) struct PointerMovement {
+    pub packets: Vec<(u16, Vec<u8>)>,
+    pub reached: (i32, i32),
+    pub complete: bool,
+}
+
+/// Picks the pointer message(s) the server actually wants.
 ///
 /// The mode is the server's to choose and it never negotiates twice: CLIENT
 /// means absolute positions, SERVER means relative deltas derived from [`last`].
@@ -546,12 +599,55 @@ pub(crate) fn encode_pointer(
     x: i32,
     y: i32,
     last: Option<(i32, i32)>,
-) -> (u16, Vec<u8>) {
+) -> PointerMovement {
     if mode == SPICE_MOUSE_MODE_SERVER {
         let (dx, dy) = last.map_or((0, 0), |(px, py)| (x - px, y - py));
-        encode_mouse_motion(dx, dy, 0)
+        split_motion(dx, dy)
     } else {
-        encode_mouse_position(x, y, 0)
+        PointerMovement {
+            packets: vec![encode_mouse_position(x, y, 0)],
+            reached: (x, y),
+            complete: true,
+        }
+    }
+}
+
+/// Splits a relative delta into packets the PS/2 wire can carry.
+///
+/// QEMU's PS/2 emulation clamps each packet's dx/dy to ±127 and drops the rest
+/// (hw/input/ps2.c), and a single out-of-range packet leaves the guest behind
+/// the client's tracked position permanently — every later delta is then
+/// computed from a `last` the guest never reached, so the pointer desyncs in a
+/// way more movement "unlocks" (and looks directional, since the parked
+/// remainder can only be walked off one ±127 packet at a time). A physical
+/// fast mouse sends several packets per frame; so does this, bounded by what
+/// the flow window can hold so a huge snap (or first-motion after a long
+/// idle) makes progress across acks instead of either losing distance or
+/// exceeding the window permanently.
+fn split_motion(dx: i32, dy: i32) -> PointerMovement {
+    const MAX: i32 = 127;
+    let n = ((dx.abs()).max(dy.abs()) / MAX + 1).min(MOTION_OUTSTANDING_LIMIT as i32);
+    let (mut rem_x, mut rem_y) = (dx, dy);
+    let mut packets = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let cx = if rem_x.abs() > MAX {
+            MAX * rem_x.signum()
+        } else {
+            rem_x
+        };
+        let cy = if rem_y.abs() > MAX {
+            MAX * rem_y.signum()
+        } else {
+            rem_y
+        };
+        packets.push(encode_mouse_motion(cx, cy, 0));
+        rem_x -= cx;
+        rem_y -= cy;
+    }
+    PointerMovement {
+        packets,
+        reached: (dx - rem_x, dy - rem_y),
+        complete: rem_x == 0 && rem_y == 0,
     }
 }
 
@@ -717,32 +813,89 @@ mod tests {
     #[test]
     fn test_encode_pointer_routes_on_server_mode() {
         // SERVER mode: relative, and the delta is measured from the last point.
-        let (ty, data) = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, Some((10, 10)));
-        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_MOTION);
-        assert_eq!(&data[0..4], &3i32.to_le_bytes());
-        assert_eq!(&data[4..8], &(-3i32).to_le_bytes());
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, Some((10, 10)));
+        assert_eq!(mv.packets.len(), 1);
+        assert_eq!(mv.packets[0].0, SPICE_MSGC_INPUTS_MOUSE_MOTION);
+        assert_eq!(&mv.packets[0].1[0..4], &3i32.to_le_bytes());
+        assert_eq!(&mv.packets[0].1[4..8], &(-3i32).to_le_bytes());
 
         // No previous point yet: report no movement rather than a jump from
         // wherever the pointer happened to be.
-        let (ty, data) = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, None);
-        assert_eq!(ty, SPICE_MSGC_INPUTS_MOUSE_MOTION);
-        assert_eq!(&data[0..4], &0i32.to_le_bytes());
-        assert_eq!(&data[4..8], &0i32.to_le_bytes());
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, None);
+        assert_eq!(mv.packets.len(), 1);
+        assert_eq!(mv.packets[0].0, SPICE_MSGC_INPUTS_MOUSE_MOTION);
+        assert_eq!(&mv.packets[0].1[0..4], &0i32.to_le_bytes());
+        assert_eq!(&mv.packets[0].1[4..8], &0i32.to_le_bytes());
     }
 
     #[test]
     fn test_encode_pointer_stays_absolute_for_client_and_unannounced() {
         assert_eq!(
-            encode_pointer(SPICE_MOUSE_MODE_CLIENT, 13, 7, Some((10, 10))).0,
+            encode_pointer(SPICE_MOUSE_MODE_CLIENT, 13, 7, Some((10, 10))).packets[0].0,
             SPICE_MSGC_INPUTS_MOUSE_POSITION
         );
         // Mode 0 = the server has not said yet. Absolute is what shipped before
         // and is correct for a tablet guest, so an early event must not become
         // a stray relative delta.
         assert_eq!(
-            encode_pointer(0, 13, 7, Some((10, 10))).0,
+            encode_pointer(0, 13, 7, Some((10, 10))).packets[0].0,
             SPICE_MSGC_INPUTS_MOUSE_POSITION
         );
+    }
+
+    // #572: QEMU's PS/2 emulation clamps each packet's dx/dy to ±127 and drops
+    // the rest (hw/input/ps2.c). A fast swipe arrives as ONE UI event with a
+    // huge delta; encoded as a single motion packet the guest applies only the
+    // first ±127 and the pointer falls behind — lag that more movement "clears",
+    // and at connect it looks directional (left can't overcome the clamp from
+    // the parked position). The fix is what a physical fast mouse does: split
+    // the movement into ≤127-per-packet steps.
+    #[test]
+    fn server_mode_splits_oversized_delta_into_127_steps() {
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 500, -320, Some((100, 0)));
+        // dx=400 → 127+127+127+19; dy=-320 → -127-127-66. Longest axis: 4 packets.
+        assert_eq!(mv.packets.len(), 4);
+        assert!(mv.complete);
+        assert_eq!(mv.reached, (400, -320));
+        let sum: (i32, i32) = mv
+            .packets
+            .iter()
+            .map(|(_, d)| {
+                (
+                    i32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+                    i32::from_le_bytes([d[4], d[5], d[6], d[7]]),
+                )
+            })
+            .fold((0, 0), |(ax, ay), (dx, dy)| (ax + dx, ay + dy));
+        assert_eq!(sum, (400, -320), "total displacement must survive the split");
+        for (_, d) in &mv.packets {
+            let dx = i32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+            let dy = i32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+            assert!(dx.abs() <= 127 && dy.abs() <= 127, "packet exceeds PS/2 range: {dx},{dy}");
+        }
+    }
+
+    #[test]
+    fn server_mode_snap_bounded_to_window_reports_partial_reach() {
+        // A snap larger than the window (8×127 px) must not exceed the window:
+        // it sends what fits, reports where the guest actually got to, and
+        // marks itself incomplete so the caller parks the rest.
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 10000, 0, Some((0, 0)));
+        assert_eq!(mv.packets.len(), MOTION_OUTSTANDING_LIMIT as usize);
+        assert!(!mv.complete);
+        assert_eq!(mv.reached.0, MOTION_OUTSTANDING_LIMIT as i32 * 127);
+        assert_eq!(mv.reached.1, 0);
+    }
+
+    #[test]
+    fn server_mode_small_delta_stays_one_packet() {
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 110, 5, Some((100, 0)));
+        assert_eq!(mv.packets.len(), 1);
+        assert_eq!(mv.packets[0].1[0..4], 10i32.to_le_bytes());
+        // No previous point: still one no-op packet, not a jump.
+        let mv = encode_pointer(SPICE_MOUSE_MODE_SERVER, 13, 7, None);
+        assert_eq!(mv.packets.len(), 1);
+        assert_eq!(mv.packets[0].1[0..4], 0i32.to_le_bytes());
     }
 
     #[test]
@@ -785,11 +938,13 @@ mod motion_flow_tests {
         // Over the window: parked, newest coordinates win.
         assert!(!flow.try_acquire(100, 100));
         assert!(!flow.try_acquire(200, 200));
-        // One ack releases a bunch of credit and yields the newest parked target.
-        assert_eq!(flow.on_ack(), Some((200, 200)));
+        // One ack releases a bunch of credit; take_pending yields the newest.
+        flow.on_ack();
+        assert_eq!(flow.take_pending(), Some((200, 200)));
         // Credit is back: the next pointer message sends.
         assert!(flow.try_acquire(201, 200));
         // Nothing parked now; an ack yields no flush.
-        assert_eq!(flow.on_ack(), None);
+        flow.on_ack();
+        assert_eq!(flow.take_pending(), None);
     }
 }

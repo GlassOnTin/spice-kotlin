@@ -990,21 +990,40 @@ impl SpiceClientShared {
         // #572: pace pointer messages against the server's acks. When the
         // window is full the target is parked and the inputs channel's ack
         // handler flushes it, so a drag's final position always lands.
-        if !flow.try_acquire(x, y) {
-            return Ok(());
-        }
-        let msg = {
-            let mut guard = last.lock().unwrap();
-            let msg = encode_pointer(
-                mode.load(std::sync::atomic::Ordering::Relaxed),
-                x,
-                y,
-                *guard,
-            );
-            *guard = Some((x, y));
-            msg
+        // A SERVER-mode movement may split into several wire packets (PS/2
+        // carries ≤127 per packet); the whole movement claims the window as
+        // one unit so a partial send never desyncs client and guest. A snap
+        // too large for the window sends what fits and parks the final target
+        // so later acks walk the remainder off.
+        let (mv, prev) = {
+            let guard = last.lock().unwrap();
+            let prev = *guard;
+            (
+                encode_pointer(
+                    mode.load(std::sync::atomic::Ordering::Relaxed),
+                    x,
+                    y,
+                    prev,
+                ),
+                prev,
+            )
         };
-        self.enqueue_input(channel_id, msg).await
+        if !flow.try_acquire_n(mv.packets.len() as u32, x, y) {
+            return Ok(()); // parked; the ack handler retries
+        }
+        if !mv.complete {
+            flow.park_pending(x, y);
+        }
+        *last.lock().unwrap() = Some(if mv.complete {
+            (x, y)
+        } else {
+            let (px, py) = prev.unwrap_or((0, 0));
+            (px + mv.reached.0, py + mv.reached.1)
+        });
+        for msg in mv.packets {
+            self.enqueue_input(channel_id, msg).await?;
+        }
+        Ok(())
     }
 
     /// Sends a mouse button event to the specified inputs channel.
